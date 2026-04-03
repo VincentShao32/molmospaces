@@ -274,7 +274,6 @@ data = np.load("episode_00000000_exo_camera_1_point_tracks.npz")
 #### Sampling Modes
 
 - **`"vertex"`**: Samples actual mesh vertices from all non-world bodies, distributing the point budget equally across bodies. Fast and deterministic but some points may start occluded.
-- **`"image"`** (recommended): Renders depth and segmentation, picks random visible pixels on manipulable objects (bodies with free joints), unprojects to 3D surface points, and converts to body-local coordinates for rigid tracking. All points are guaranteed visible at frame 0.
 
 
 ## Teleop Input
