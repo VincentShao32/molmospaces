@@ -77,6 +77,54 @@ class FrankaPickDroidDataGenConfig(PickBaseConfig):
         return "franka_pick_droid_datagen"
 
 
+@register_config("FrankaPickPointTrackDebug")
+class FrankaPickPointTrackDebug(PickBaseConfig):
+    """Debug config for testing point tracking generation."""
+
+    robot_config: BaseRobotConfig = FrankaRobotConfig()
+    camera_config: FrankaDroidCameraSystem = FrankaDroidCameraSystem()
+    output_dir: Path = ASSETS_DIR / "experiment_output" / "datagen" / "pick_point_track_debug"
+    task_sampler_config: PickTaskSamplerConfig = PickTaskSamplerConfig(
+        task_sampler_class=PickTaskSampler,
+        house_inds=[0, 1, 2],
+        samples_per_house=5,
+    )
+    num_workers: int = 1
+    use_wandb: bool = False
+    filter_for_successful_trajectories: bool = False
+    generate_point_tracks: bool = True
+    point_track_num_points: int = 256
+    point_track_sampling: str = "vertex"
+
+    @property
+    def tag(self) -> str:
+        return "franka_pick_point_track_debug"
+
+
+@register_config("CoTracker3Eval")
+class CoTracker3Eval(PickBaseConfig):
+    """Eval set for CoTracker3: 60 videos, 30 point tracks each."""
+
+    robot_config: BaseRobotConfig = FrankaRobotConfig()
+    camera_config: FrankaDroidCameraSystem = FrankaDroidCameraSystem()
+    output_dir: Path = Path("/gpfs/scrubbed/yunbos/video_datasets/cotracker3-eval-datasets/molmospaces")
+    task_sampler_config: PickTaskSamplerConfig = PickTaskSamplerConfig(
+        task_sampler_class=PickTaskSampler,
+        house_inds=[0, 1, 3],
+        samples_per_house=10,
+    )
+    num_workers: int = 1
+    use_wandb: bool = False
+    filter_for_successful_trajectories: bool = False
+    generate_point_tracks: bool = True
+    point_track_num_points: int = 30
+    point_track_sampling: str = "image"
+
+    @property
+    def tag(self) -> str:
+        return "cotracker3_eval"
+
+
 @register_config("FrankaPickGoProD405D455DataGenConfig")
 class FrankaPickGoProD405D455DataGenConfig(PickBaseConfig):
     """Data generation config for Franka pick task with GoPro D405 cameras."""

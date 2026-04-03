@@ -214,6 +214,69 @@ python molmo_spaces/data_generation/main.py FrankaPickOmniCamConfig
 ```
 
 
+### Point Track Generation
+
+The data generation pipeline can produce per-video point tracking data alongside RGB videos. Point tracks consist of 2D trajectories, 3D positions, and per-frame visibility (occlusion) labels for a set of sampled surface points, saved as `.npz` files.
+
+#### Enabling Point Tracks in a Config
+
+Add these fields to any experiment config (see `molmo_spaces/configs/abstract_exp_config.py`):
+
+```python
+generate_point_tracks: bool = True
+point_track_num_points: int = 256        # number of points to track
+point_track_sampling: str = "image"      # "vertex" or "image"
+```
+
+| Field | Description |
+|---|---|
+| `generate_point_tracks` | Enable point track generation |
+| `point_track_num_points` | Number of surface points to sample and track per episode |
+| `point_track_sampling` | `"vertex"` samples actual mesh vertices with equal per-body allocation. `"image"` (recommended) picks visible pixels from the rendered image and unprojects to 3D, Kubric/TAP-Vid style — guarantees initial visibility. |
+
+A ready-made debug config is provided:
+
+```python
+@register_config("FrankaPickPointTrackDebug")
+class FrankaPickPointTrackDebug(PickBaseConfig):
+    generate_point_tracks: bool = True
+    point_track_num_points: int = 256
+    point_track_sampling: str = "vertex"
+    ...
+```
+
+#### Running
+
+```bash
+cd molmospaces
+MUJOCO_GL=egl PYOPENGL_PLATFORM=egl python -m molmo_spaces.data_generation.main FrankaPickPointTrackDebug
+```
+
+#### Output Format
+
+For each episode and camera, a file `episode_XXXXXXXX_<camera>_point_tracks.npz` is saved alongside the video. Load it with:
+
+```python
+import numpy as np
+data = np.load("episode_00000000_exo_camera_1_point_tracks.npz")
+```
+
+| Key | Shape | Description |
+|---|---|---|
+| `trajs_2d` | `(T, N, 2)` | 2D pixel coordinates per frame |
+| `visibility` | `(T, N)` | `1.0` = visible, `0.0` = occluded or out of frame |
+| `points_3d` | `(T, N, 3)` | 3D world positions per frame |
+| `points_3d_initial` | `(N, 3)` | 3D world positions at the sampling frame |
+| `body_ids` | `(N,)` | MuJoCo body ID each point belongs to |
+| `intrinsics` | `(3, 3)` | Camera intrinsic matrix |
+| `num_sampled_from` | scalar | Total mesh vertex count across tracked bodies |
+
+#### Sampling Modes
+
+- **`"vertex"`**: Samples actual mesh vertices from all non-world bodies, distributing the point budget equally across bodies. Fast and deterministic but some points may start occluded.
+- **`"image"`** (recommended): Renders depth and segmentation, picks random visible pixels on manipulable objects (bodies with free joints), unprojects to 3D surface points, and converts to body-local coordinates for rigid tracking. All points are guaranteed visible at frame 0.
+
+
 ## Teleop Input
 
 To control a robot via phone based teleoperation do the following (only iPhones supported).

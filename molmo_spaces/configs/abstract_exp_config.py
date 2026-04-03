@@ -100,6 +100,11 @@ class MlSpacesExpConfig(Config, ABC):
     use_filament: bool = False
     environment_light_intensity: float = 15000.0
 
+    # Point tracking
+    generate_point_tracks: bool = False
+    point_track_num_points: int = 5000
+    point_track_sampling: str = "vertex"  # "vertex" or "image"
+
     def model_post_init(self, _context) -> None:
         """This serves as the __init__() called after internal validation of config parameters"""
         assert (self.policy_dt_ms / self.ctrl_dt_ms).is_integer(), (
