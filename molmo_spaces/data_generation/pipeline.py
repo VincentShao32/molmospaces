@@ -31,7 +31,7 @@ from molmo_spaces.utils.mp_logging import (
     worker_stdout_context,
 )
 from molmo_spaces.utils.point_tracking_utils import (
-    get_object_body_ids,
+    get_trackable_body_ids,
     sample_from_image,
     sample_mesh_vertices,
     save_point_tracks,
@@ -791,7 +791,7 @@ class ParallelRolloutRunner:
                             camera = env.camera_manager.registry[cam_name]
                             depth = env.render_depth_frame(cam_name)
                             seg = env.render_segmentation_frame(cam_name)
-                            obj_bids = get_object_body_ids(env.mj_model)
+                            obj_bids = get_trackable_body_ids(env.mj_model)
                             lc, bi, wc, tv = sample_from_image(
                                 env.mj_model, env.current_data,
                                 camera, img_w, img_h, depth, seg,
@@ -804,6 +804,34 @@ class ParallelRolloutRunner:
                             cam_entry["initial_world"] = wc
                             cam_entry["total_verts"] = tv
                     pt_per_camera[cam_cfg.name] = cam_entry
+
+        # Record initial tracking frame (matches the video frame from task.reset())
+        if do_point_tracking and len(pt_per_camera) > 0:
+            env = task.env
+            for cam_name, cam_data in pt_per_camera.items():
+                if cam_name not in env.camera_manager.registry:
+                    continue
+                camera = env.camera_manager.registry[cam_name]
+                depth = env.render_depth_frame(cam_name)
+                lc = cam_data.get("local_coords", pt_local_coords)
+                bi = cam_data.get("body_ids", pt_body_ids)
+                if lc is None or len(lc) == 0:
+                    continue
+                coords_2d, vis, world_pts = track_points_for_frame(
+                    env.current_data, lc, bi, camera,
+                    cam_data["img_w"], cam_data["img_h"], depth,
+                )
+                cam_data["trajs_2d"].append(coords_2d)
+                cam_data["visibility"].append(vis)
+                cam_data["points_3d"].append(world_pts)
+                if cam_data["intrinsics"] is None:
+                    from molmo_spaces.utils.point_tracking_utils import (
+                        _build_camera_matrices,
+                    )
+                    _, intrinsics = _build_camera_matrices(
+                        camera, cam_data["img_w"], cam_data["img_h"]
+                    )
+                    cam_data["intrinsics"] = intrinsics
 
         if viewer is not None:
             viewer.sync()

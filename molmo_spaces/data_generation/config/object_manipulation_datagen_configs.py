@@ -94,11 +94,35 @@ class FrankaPickPointTrackDebug(PickBaseConfig):
     filter_for_successful_trajectories: bool = False
     generate_point_tracks: bool = True
     point_track_num_points: int = 256
-    point_track_sampling: str = "vertex"
+    point_track_sampling: str = "image"
 
     @property
     def tag(self) -> str:
         return "franka_pick_point_track_debug"
+
+
+@register_config("FrankaPickAndPlacePointTrack")
+class FrankaPickAndPlacePointTrack(PickAndPlaceDataGenConfig):
+    """Pick-and-place with point tracking."""
+
+    robot_config: BaseRobotConfig = FrankaRobotConfig()
+    camera_config: FrankaDroidCameraSystem = FrankaDroidCameraSystem()
+    output_dir: Path = ASSETS_DIR / "experiment_output" / "datagen" / "pick_and_place_point_track"
+    task_sampler_config: PickAndPlaceTaskSamplerConfig = PickAndPlaceTaskSamplerConfig(
+        task_sampler_class=PickAndPlaceTaskSampler,
+        house_inds=list(range(10)),
+        samples_per_house=5,
+    )
+    num_workers: int = 1
+    use_wandb: bool = False
+    filter_for_successful_trajectories: bool = False
+    generate_point_tracks: bool = True
+    point_track_num_points: int = 256
+    point_track_sampling: str = "image"
+
+    @property
+    def tag(self) -> str:
+        return "franka_pick_and_place_point_track"
 
 
 @register_config("CoTracker3Eval")

@@ -129,7 +129,6 @@ def get_object_body_ids(model: MjModel) -> set[int]:
     freejoints = np.where(model.jnt_type == mujoco.mjtJoint.mjJNT_FREE)[0]
     root_bids = set(int(model.jnt_bodyid[j]) for j in freejoints)
 
-    # BFS to collect all descendant bodies of each free-joint root
     for root in root_bids:
         queue = [root]
         while queue:
@@ -139,6 +138,21 @@ def get_object_body_ids(model: MjModel) -> set[int]:
             queue.extend(int(c) for c in children)
 
     return object_bids
+
+
+def get_robot_body_ids(model: MjModel, namespace: str = "robot_0/") -> set[int]:
+    """Return body IDs of all robot bodies (identified by name prefix)."""
+    robot_bids: set[int] = set()
+    for bid in range(model.nbody):
+        name = model.body(bid).name
+        if name.startswith(namespace):
+            robot_bids.add(bid)
+    return robot_bids
+
+
+def get_trackable_body_ids(model: MjModel) -> set[int]:
+    """Return body IDs suitable for point tracking: objects + robot arm."""
+    return get_object_body_ids(model) | get_robot_body_ids(model)
 
 
 def sample_from_image(
