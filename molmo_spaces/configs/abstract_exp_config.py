@@ -104,6 +104,8 @@ class MlSpacesExpConfig(Config, ABC):
     generate_point_tracks: bool = False
     point_track_num_points: int = 5000
     point_track_sampling: str = "vertex"  # "vertex" or "image"
+    point_track_query_interval: int = 0  # 0 = all points from frame 0; N>0 = preview mode
+    point_tracks_only: bool = False  # skip HDF5/depth/robot-state sensors, keep only RGB + point tracks
 
     def model_post_init(self, _context) -> None:
         """This serves as the __init__() called after internal validation of config parameters"""

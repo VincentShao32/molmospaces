@@ -222,7 +222,7 @@ class CuroboPickAndPlacePlannerPolicy(CuroboPlannerPolicy, PickAndPlacePlannerPo
         support_below = om.get_support_below(pickup_obj_name, RECEPTACLE_TYPES_THOR)
         target_object_names.add(support_below)
 
-        from molmo_spaces.editor.constants import ALL_PICKUP_TYPES_THOR
+        from molmo_spaces.utils.constants.object_constants import ALL_PICKUP_TYPES_THOR
 
         objects_on_surface_below = om.get_objects_that_are_on_top_of_object(
             support_below, pickup_types=ALL_PICKUP_TYPES_THOR

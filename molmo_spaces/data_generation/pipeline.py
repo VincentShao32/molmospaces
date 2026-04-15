@@ -31,6 +31,7 @@ from molmo_spaces.utils.mp_logging import (
     worker_stdout_context,
 )
 from molmo_spaces.utils.point_tracking_utils import (
+    _build_camera_matrices,
     get_trackable_body_ids,
     sample_from_image,
     sample_mesh_vertices,
@@ -38,7 +39,11 @@ from molmo_spaces.utils.point_tracking_utils import (
     track_points_for_frame,
 )
 from molmo_spaces.utils.profiler_utils import DatagenProfiler, Profiler
-from molmo_spaces.utils.save_utils import prepare_episode_for_saving, save_trajectories
+from molmo_spaces.utils.save_utils import (
+    prepare_episode_for_saving,
+    save_trajectories,
+    save_videos_from_raw_observations,
+)
 
 # Set multiprocessing context based on CUDA availability
 # forkserver is safer for CUDA, spawn for fallback
@@ -47,6 +52,22 @@ mp_context = mp.get_context("forkserver") if torch.cuda.is_available() else mp.g
 # Silence verbose third-party libraries
 logging.getLogger("curobo").setLevel(logging.WARNING)
 logging.getLogger("trimesh").setLevel(logging.WARNING)
+
+
+import numpy as np
+
+
+class _BodyPoseSnapshot:
+    """Lightweight stand-in for MjData exposing only xpos/xmat from stored arrays."""
+    __slots__ = ("xpos", "xmat")
+
+    def __init__(self, xpos: np.ndarray, xmat: np.ndarray):
+        self.xpos = xpos
+        self.xmat = xmat
+
+
+def _make_mock_data(xpos: np.ndarray, xmat: np.ndarray) -> _BodyPoseSnapshot:
+    return _BodyPoseSnapshot(xpos, xmat)
 
 
 def get_process_memory():
@@ -213,6 +234,7 @@ def save_house_trajectories(
         worker_logger.warning(f"No trajectory data to save for {house_output_dir.name}")
         return
 
+    pt_only = getattr(exp_config, "point_tracks_only", False)
     batch_info = f" batch {batch_num}/{total_batches}" if batch_num is not None else ""
     worker_logger.info(
         f"Batching and saving trajectory data for {house_output_dir.name}{batch_info}: "
@@ -228,16 +250,31 @@ def save_house_trajectories(
 
         house_trajectory_data = []
         for idx, episode_info in enumerate(house_raw_histories):
-            prepared_episode = prepare_episode_for_saving(
-                episode_info["history"],
-                episode_info["sensor_suite"],
-                fps=exp_config.fps,
-                save_dir=house_output_dir,
-                episode_idx=idx,
-                save_file_suffix=batch_suffix,
-            )
-            if prepared_episode is not None:
-                house_trajectory_data.append(prepared_episode)
+            if pt_only:
+                # Save only RGB videos, skip all batching / HDF5 prep
+                observations_list = episode_info["history"].get("observations", [])
+                if observations_list:
+                    flattened_obs = [ts[0] for ts in observations_list]
+                    save_videos_from_raw_observations(
+                        flattened_obs,
+                        house_output_dir,
+                        exp_config.fps,
+                        episode_idx=idx,
+                        save_file_suffix=batch_suffix,
+                        sensor_suite=episode_info.get("sensor_suite"),
+                    )
+                    del flattened_obs
+            else:
+                prepared_episode = prepare_episode_for_saving(
+                    episode_info["history"],
+                    episode_info["sensor_suite"],
+                    fps=exp_config.fps,
+                    save_dir=house_output_dir,
+                    episode_idx=idx,
+                    save_file_suffix=batch_suffix,
+                )
+                if prepared_episode is not None:
+                    house_trajectory_data.append(prepared_episode)
             del episode_info["history"]
 
             # Save point tracking data if present
@@ -257,6 +294,7 @@ def save_house_trajectories(
                         body_ids=cam_tracks["body_ids"],
                         intrinsics=cam_tracks["intrinsics"],
                         total_mesh_verts=cam_tracks["total_mesh_verts"],
+                        query_frames=cam_tracks.get("query_frames"),
                     )
                 worker_logger.info(
                     f"Saved point tracks for episode {idx} "
@@ -270,20 +308,23 @@ def save_house_trajectories(
             datagen_profiler.end("save_batch_prep")
         worker_logger.debug(f"Batched {len(house_trajectory_data)} episodes in {t_batch:.2f}s")
 
-        t_save_start = time.perf_counter()
-        if datagen_profiler is not None:
-            datagen_profiler.start("save_trajectories")
-        save_trajectories(
-            house_trajectory_data,
-            save_dir=house_output_dir,
-            fps=exp_config.fps,
-            save_file_suffix=batch_suffix,
-            save_mp4s=True,
-            logger=worker_logger,
-        )
-        if datagen_profiler is not None:
-            datagen_profiler.end("save_trajectories")
-        t_save = time.perf_counter() - t_save_start
+        if not pt_only:
+            t_save_start = time.perf_counter()
+            if datagen_profiler is not None:
+                datagen_profiler.start("save_trajectories")
+            save_trajectories(
+                house_trajectory_data,
+                save_dir=house_output_dir,
+                fps=exp_config.fps,
+                save_file_suffix=batch_suffix,
+                save_mp4s=True,
+                logger=worker_logger,
+            )
+            if datagen_profiler is not None:
+                datagen_profiler.end("save_trajectories")
+            t_save = time.perf_counter() - t_save_start
+        else:
+            t_save = 0.0
 
         total_time = time.perf_counter() - t_start
         worker_logger.info(
@@ -751,23 +792,35 @@ class ParallelRolloutRunner:
             and getattr(exp_config, "generate_point_tracks", False)
         )
         pt_sampling = getattr(exp_config, "point_track_sampling", "vertex") if exp_config else "vertex"
+        pt_query_interval = getattr(exp_config, "point_track_query_interval", 0) if exp_config else 0
         pt_local_coords = None
         pt_body_ids = None
         pt_initial_world = None
         pt_total_verts = 0
         pt_per_camera: dict[str, dict] = {}
+        total_budget = 0
+        pt_stored_body_xpos: list[np.ndarray] = []
+        pt_stored_body_xmat: list[np.ndarray] = []
+        pt_stored_depths: dict[str, list[np.ndarray]] = {}
+        pt_stored_cam_matrices: dict[str, list[tuple[np.ndarray, np.ndarray]]] = {}
+        pt_preview_mode = False
 
         if do_point_tracking:
+            import numpy as np
+
             env = task.env
             img_w, img_h = (624, 352)
             if exp_config.camera_config is not None:
                 img_w, img_h = exp_config.camera_config.img_resolution
 
+            total_budget = exp_config.point_track_num_points
+            pt_preview_mode = pt_query_interval > 0 and pt_sampling == "image"
+
             if pt_sampling == "vertex":
                 local_coords, body_ids, world_coords, total_verts = sample_mesh_vertices(
                     env.mj_model,
                     env.current_data,
-                    max_points=exp_config.point_track_num_points,
+                    max_points=total_budget,
                     seed=episode_seed,
                 )
                 pt_local_coords = local_coords
@@ -776,6 +829,7 @@ class ParallelRolloutRunner:
                 pt_total_verts = total_verts
 
             if exp_config.camera_config is not None:
+                obj_bids = get_trackable_body_ids(env.mj_model) if pt_sampling == "image" else None
                 for cam_cfg in exp_config.camera_config.cameras:
                     cam_entry = {
                         "trajs_2d": [],
@@ -784,18 +838,18 @@ class ParallelRolloutRunner:
                         "intrinsics": None,
                         "img_w": img_w,
                         "img_h": img_h,
+                        "query_frames": [],
                     }
-                    if pt_sampling == "image":
+                    if pt_sampling == "image" and not pt_preview_mode:
                         cam_name = cam_cfg.name
                         if cam_name in env.camera_manager.registry:
                             camera = env.camera_manager.registry[cam_name]
                             depth = env.render_depth_frame(cam_name)
                             seg = env.render_segmentation_frame(cam_name)
-                            obj_bids = get_trackable_body_ids(env.mj_model)
                             lc, bi, wc, tv = sample_from_image(
                                 env.mj_model, env.current_data,
                                 camera, img_w, img_h, depth, seg,
-                                max_points=exp_config.point_track_num_points,
+                                max_points=total_budget,
                                 seed=episode_seed,
                                 object_body_ids=obj_bids,
                             )
@@ -803,16 +857,47 @@ class ParallelRolloutRunner:
                             cam_entry["body_ids"] = bi
                             cam_entry["initial_world"] = wc
                             cam_entry["total_verts"] = tv
+                            cam_entry["query_frames"] = [0] * len(lc)
+                    if pt_preview_mode:
+                        cam_entry["_candidates_lc"] = []
+                        cam_entry["_candidates_bi"] = []
                     pt_per_camera[cam_cfg.name] = cam_entry
 
         # Record initial tracking frame (matches the video frame from task.reset())
         if do_point_tracking and len(pt_per_camera) > 0:
             env = task.env
+            if pt_preview_mode:
+                pt_stored_body_xpos.append(env.current_data.xpos.copy())
+                pt_stored_body_xmat.append(env.current_data.xmat.copy())
             for cam_name, cam_data in pt_per_camera.items():
                 if cam_name not in env.camera_manager.registry:
                     continue
                 camera = env.camera_manager.registry[cam_name]
                 depth = env.render_depth_frame(cam_name)
+                if pt_preview_mode:
+                    if cam_name not in pt_stored_depths:
+                        pt_stored_depths[cam_name] = []
+                    if cam_name not in pt_stored_cam_matrices:
+                        pt_stored_cam_matrices[cam_name] = []
+                    pt_stored_depths[cam_name].append(depth.copy())
+                    w2c, intr = _build_camera_matrices(
+                        camera, cam_data["img_w"], cam_data["img_h"]
+                    )
+                    pt_stored_cam_matrices[cam_name].append((w2c.copy(), intr.copy()))
+                    cam_data["intrinsics"] = intr.copy()
+                    seg = env.render_segmentation_frame(cam_name)
+                    cand_lc, cand_bi, _, _ = sample_from_image(
+                        env.mj_model, env.current_data,
+                        camera, cam_data["img_w"], cam_data["img_h"],
+                        depth, seg,
+                        max_points=total_budget,
+                        seed=episode_seed,
+                        object_body_ids=obj_bids,
+                    )
+                    if len(cand_lc) > 0:
+                        cam_data["_candidates_lc"].append(cand_lc)
+                        cam_data["_candidates_bi"].append(cand_bi)
+                    continue
                 lc = cam_data.get("local_coords", pt_local_coords)
                 bi = cam_data.get("body_ids", pt_body_ids)
                 if lc is None or len(lc) == 0:
@@ -825,9 +910,6 @@ class ParallelRolloutRunner:
                 cam_data["visibility"].append(vis)
                 cam_data["points_3d"].append(world_pts)
                 if cam_data["intrinsics"] is None:
-                    from molmo_spaces.utils.point_tracking_utils import (
-                        _build_camera_matrices,
-                    )
                     _, intrinsics = _build_camera_matrices(
                         camera, cam_data["img_w"], cam_data["img_h"]
                     )
@@ -876,33 +958,54 @@ class ParallelRolloutRunner:
 
             # Point tracking per frame
             if do_point_tracking and len(pt_per_camera) > 0:
+                import numpy as np
+
                 env = task.env
+                frame_idx = step_count + 1  # +1 because frame 0 is the initial frame
+
+                if pt_preview_mode:
+                    pt_stored_body_xpos.append(env.current_data.xpos.copy())
+                    pt_stored_body_xmat.append(env.current_data.xmat.copy())
+
                 for cam_name, cam_data in pt_per_camera.items():
                     if cam_name not in env.camera_manager.registry:
                         continue
                     camera = env.camera_manager.registry[cam_name]
                     depth = env.render_depth_frame(cam_name)
-                    # Use per-camera coords (image mode) or shared coords (vertex mode)
+
+                    if pt_preview_mode:
+                        pt_stored_depths[cam_name].append(depth.copy())
+                        w2c, intr = _build_camera_matrices(
+                            camera, cam_data["img_w"], cam_data["img_h"]
+                        )
+                        pt_stored_cam_matrices[cam_name].append((w2c.copy(), intr.copy()))
+                        if step_count % pt_query_interval == 0:
+                            seg = env.render_segmentation_frame(cam_name)
+                            cand_lc, cand_bi, _, _ = sample_from_image(
+                                env.mj_model, env.current_data,
+                                camera, cam_data["img_w"], cam_data["img_h"],
+                                depth, seg,
+                                max_points=total_budget,
+                                seed=episode_seed + frame_idx,
+                                object_body_ids=obj_bids,
+                            )
+                            if len(cand_lc) > 0:
+                                cam_data["_candidates_lc"].append(cand_lc)
+                                cam_data["_candidates_bi"].append(cand_bi)
+                        continue
+
                     lc = cam_data.get("local_coords", pt_local_coords)
                     bi = cam_data.get("body_ids", pt_body_ids)
                     if lc is None or len(lc) == 0:
                         continue
                     coords_2d, vis, world_pts = track_points_for_frame(
-                        env.current_data,
-                        lc,
-                        bi,
-                        camera,
-                        cam_data["img_w"],
-                        cam_data["img_h"],
-                        depth,
+                        env.current_data, lc, bi, camera,
+                        cam_data["img_w"], cam_data["img_h"], depth,
                     )
                     cam_data["trajs_2d"].append(coords_2d)
                     cam_data["visibility"].append(vis)
                     cam_data["points_3d"].append(world_pts)
                     if cam_data["intrinsics"] is None:
-                        from molmo_spaces.utils.point_tracking_utils import (
-                            _build_camera_matrices,
-                        )
                         _, intrinsics = _build_camera_matrices(
                             camera, cam_data["img_w"], cam_data["img_h"]
                         )
@@ -939,14 +1042,70 @@ class ParallelRolloutRunner:
         if do_point_tracking and len(pt_per_camera) > 0:
             import numpy as np
 
+            # Preview mode Phase 2: sample from candidates and compute full tracks
+            if pt_preview_mode:
+                n_frames = len(pt_stored_body_xpos)
+                rng = np.random.RandomState(episode_seed + 9999)
+                for cam_name, cam_data in pt_per_camera.items():
+                    cand_lc_list = cam_data.pop("_candidates_lc", [])
+                    cand_bi_list = cam_data.pop("_candidates_bi", [])
+                    if not cand_lc_list:
+                        continue
+                    all_lc = np.concatenate(cand_lc_list, axis=0)
+                    all_bi = np.concatenate(cand_bi_list, axis=0)
+
+                    n_sample = min(total_budget, len(all_lc))
+                    idx = rng.choice(len(all_lc), n_sample, replace=False)
+                    final_lc = all_lc[idx]
+                    final_bi = all_bi[idx]
+
+                    cam_data["local_coords"] = final_lc
+                    cam_data["body_ids"] = final_bi
+                    cam_data["initial_world"] = None
+                    cam_data["total_verts"] = None
+
+                    stored_mats = pt_stored_cam_matrices.get(cam_name, [])
+                    stored_deps = pt_stored_depths.get(cam_name, [])
+                    for t in range(n_frames):
+                        mock_data = _make_mock_data(
+                            pt_stored_body_xpos[t], pt_stored_body_xmat[t]
+                        )
+                        past_w2c, past_intr = stored_mats[t]
+                        c2d, vis, wpts = track_points_for_frame(
+                            mock_data, final_lc, final_bi, None,
+                            cam_data["img_w"], cam_data["img_h"],
+                            stored_deps[t],
+                            precomputed_w2c=past_w2c,
+                            precomputed_intrinsics=past_intr,
+                        )
+                        cam_data["trajs_2d"].append(c2d)
+                        cam_data["visibility"].append(vis)
+                        cam_data["points_3d"].append(wpts)
+
+                    # Set query_frames to first frame each point is visible
+                    vis_stack = np.stack(cam_data["visibility"], axis=0)  # (T, N)
+                    first_vis = np.argmax(vis_stack > 0.5, axis=0)  # first True per column
+                    never_vis = vis_stack.max(axis=0) <= 0.5
+                    first_vis[never_vis] = 0
+                    cam_data["query_frames"] = first_vis.tolist()
+
+                    print(
+                        f"Preview-sampled {n_sample} points from "
+                        f"{len(all_lc)} candidates across "
+                        f"{len(cand_lc_list)} frames for {cam_name}"
+                    )
+
             point_track_data = {}
             for cam_name, cam_data in pt_per_camera.items():
                 if not cam_data["trajs_2d"]:
                     continue
-                # Per-camera data (image mode) or shared data (vertex mode)
                 cam_bids = cam_data.get("body_ids", pt_body_ids)
                 cam_init = cam_data.get("initial_world", pt_initial_world)
                 cam_tverts = cam_data.get("total_verts", pt_total_verts)
+                n_points = len(cam_bids) if cam_bids is not None else 0
+                qf = cam_data.get("query_frames", [])
+                if not qf:
+                    qf = [0] * n_points
                 point_track_data[cam_name] = {
                     "trajs_2d": np.stack(cam_data["trajs_2d"], axis=0),
                     "visibility": np.stack(cam_data["visibility"], axis=0),
@@ -955,8 +1114,13 @@ class ParallelRolloutRunner:
                     "body_ids": cam_bids,
                     "intrinsics": cam_data["intrinsics"],
                     "total_mesh_verts": cam_tverts,
+                    "query_frames": np.array(qf, dtype=np.int32),
                 }
             task._point_track_data = point_track_data
+            pt_stored_body_xpos.clear()
+            pt_stored_body_xmat.clear()
+            pt_stored_depths.clear()
+            pt_stored_cam_matrices.clear()
         else:
             task._point_track_data = None
 

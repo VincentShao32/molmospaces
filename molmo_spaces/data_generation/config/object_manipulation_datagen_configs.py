@@ -79,22 +79,24 @@ class FrankaPickDroidDataGenConfig(PickBaseConfig):
 
 @register_config("FrankaPickPointTrackDebug")
 class FrankaPickPointTrackDebug(PickBaseConfig):
-    """Debug config for testing point tracking generation."""
+    """Point tracking generation at scale."""
 
     robot_config: BaseRobotConfig = FrankaRobotConfig()
     camera_config: FrankaDroidCameraSystem = FrankaDroidCameraSystem()
-    output_dir: Path = ASSETS_DIR / "experiment_output" / "datagen" / "pick_point_track_debug"
+    output_dir: Path = ASSETS_DIR / "experiment_output" / "datagen" / "pick_point_track"
     task_sampler_config: PickTaskSamplerConfig = PickTaskSamplerConfig(
         task_sampler_class=PickTaskSampler,
-        house_inds=[0, 1, 2],
-        samples_per_house=5,
+        house_inds=list(range(3)),
+        samples_per_house=10,
     )
-    num_workers: int = 1
+    num_workers: int = 8
     use_wandb: bool = False
     filter_for_successful_trajectories: bool = False
     generate_point_tracks: bool = True
-    point_track_num_points: int = 256
+    point_track_num_points: int = 5000
     point_track_sampling: str = "image"
+    point_track_query_interval: int = 20
+    point_tracks_only: bool = True
 
     @property
     def tag(self) -> str:
@@ -119,6 +121,8 @@ class FrankaPickAndPlacePointTrack(PickAndPlaceDataGenConfig):
     generate_point_tracks: bool = True
     point_track_num_points: int = 256
     point_track_sampling: str = "image"
+    point_track_query_interval: int = 20
+    point_tracks_only: bool = True
 
     @property
     def tag(self) -> str:
@@ -143,6 +147,7 @@ class CoTracker3Eval(PickBaseConfig):
     generate_point_tracks: bool = True
     point_track_num_points: int = 30
     point_track_sampling: str = "image"
+    point_tracks_only: bool = True
 
     @property
     def tag(self) -> str:
@@ -510,6 +515,7 @@ class RBY1PickDataGenConfig(PickBaseConfig):
             left_curobo_planner_config=left_curobo_planner_config,
             right_curobo_planner_config=right_curobo_planner_config,
             enable_collision_avoidance=True,
+            server_urls=[],
         )
 
     def model_post_init(self, __context) -> None:
@@ -536,6 +542,30 @@ class RBY1PickDataGenConfig(PickBaseConfig):
     @property
     def tag(self) -> str:
         return "rby1_pick_datagen"
+
+
+@register_config("RBY1PickPointTrack")
+class RBY1PickPointTrack(RBY1PickDataGenConfig):
+    """RBY1 pick task with point tracking."""
+
+    output_dir: Path = ASSETS_DIR / "experiment_output" / "datagen" / "rby1_pick_point_track"
+    task_sampler_config: PickTaskSamplerConfig = PickTaskSamplerConfig(
+        task_sampler_class=PickTaskSampler,
+        house_inds=list(range(10)),
+        samples_per_house=50,
+    )
+    num_workers: int = 3
+    use_wandb: bool = False
+    filter_for_successful_trajectories: bool = False
+    generate_point_tracks: bool = True
+    point_track_num_points: int = 5000
+    point_track_sampling: str = "image"
+    point_track_query_interval: int = 20
+    point_tracks_only: bool = True
+
+    @property
+    def tag(self) -> str:
+        return "rby1_pick_point_track"
 
 
 @register_config("FrankaCloseDataGenConfig")

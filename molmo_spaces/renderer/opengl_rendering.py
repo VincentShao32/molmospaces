@@ -103,7 +103,7 @@ class MjOpenGLRenderer(MjAbstractRenderer):
         # Turn off site rendering
         self._scene_option.sitegroup *= 0
 
-        # Enable shadow rendering by default (shadows are controlled by lights with castshadow enabled)
+        # Shadows only appear for lights with castshadow in the MJCF; offscreen mjr supports them when True.
         self._scene.flags[mjtRndFlag.mjRND_SHADOW] = True
 
         # Create render contexts.

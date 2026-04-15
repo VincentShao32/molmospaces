@@ -262,13 +262,11 @@ class RBY1GoProD455CameraSystem(CameraSystemConfig):
 
     img_resolution: tuple[int, int] = (1024, 576)
     cameras: list[AllCameraTypes] = [
-        # Head camera - GoPro analogue (4:3, VFOV ~94deg for wide mode)
-        # Crop to 768x576 in post-processing to get 4:3 aspect ratio
         MjcfCameraConfig(
             name="head_camera",
             mjcf_name="head_camera",
             robot_namespace="robot_0/",
-            fov=139.0,  # GoPro wide mode VFOV
+            fov=70.0,
             fov_noise_degrees=(-3.0, 3.0),
             pos_noise_range=((-0.01, -0.01, -0.01), (0.01, 0.01, 0.01)),
             orientation_noise_degrees=(4.0, 4.0, 4.0),

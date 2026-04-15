@@ -1106,16 +1106,17 @@ def get_core_sensors(exp_config):
         List of initialized sensors
     """
     sensors = []
+    pt_only = getattr(exp_config, "point_tracks_only", False)
 
     # Get camera names dynamically from camera config instead of hardcoded list
     for camera_spec in exp_config.camera_config.cameras:
         camera_name = camera_spec.name
 
-        # Camera parameter sensor
-        cam_params = CameraParameterSensor(
-            camera_name=camera_name, uuid=f"sensor_param_{camera_name}"
-        )
-        sensors.append(cam_params)
+        if not pt_only:
+            cam_params = CameraParameterSensor(
+                camera_name=camera_name, uuid=f"sensor_param_{camera_name}"
+            )
+            sensors.append(cam_params)
 
         # RGB sensor
         cam_rgb = CameraSensor(
@@ -1125,8 +1126,7 @@ def get_core_sensors(exp_config):
         )
         sensors.append(cam_rgb)
 
-        # Depth sensor (conditional based on camera config)
-        if camera_spec.record_depth:
+        if not pt_only and camera_spec.record_depth:
             cam_depth = DepthSensor(
                 camera_name=camera_name,
                 img_resolution=exp_config.camera_config.img_resolution,
@@ -1137,6 +1137,11 @@ def get_core_sensors(exp_config):
         # # Segmentation sensor
         # cam_seg = SegmentationSensor(camera_name=camera_name, img_resolution=config.img_resolution, uuid=f"{camera_name}_seg")
         # sensors.append(cam_seg)
+
+    if pt_only:
+        sensors.append(RobotJointPositionSensor(uuid="qpos", max_joints=9))
+        sensors.append(TCPPoseSensor(uuid="tcp_pose"))
+        return sensors
 
     # Robot State sensors
     sensors.append(RobotJointPositionSensor(uuid="qpos", max_joints=9))

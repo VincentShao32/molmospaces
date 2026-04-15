@@ -796,9 +796,14 @@ class PickTaskSampler(BaseMujocoTaskSampler):
         if pickup_obj_name not in context_names:
             context_objects.append(om.get_object(pickup_obj_name))
 
-        expression_priority, filtered_expression_priority = self._generate_referral_expressions(
-            env, pickup_obj_name, context_objects
-        )
+        if getattr(self.config, "point_tracks_only", False):
+            fallback = om.fallback_expression(pickup_obj_name)
+            expression_priority = [(1.0, 1.0, fallback)]
+            filtered_expression_priority = expression_priority
+        else:
+            expression_priority, filtered_expression_priority = self._generate_referral_expressions(
+                env, pickup_obj_name, context_objects
+            )
 
         if self._datagen_profiler is not None:
             self._datagen_profiler.start("sample_context_expressions")

@@ -166,6 +166,7 @@ def sample_from_image(
     max_points: int = 256,
     seed: int = 0,
     object_body_ids: set[int] | None = None,
+    prefer_body_ids: set[int] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
     """Sample tracked points by picking visible pixels on objects.
 
@@ -186,6 +187,9 @@ def sample_from_image(
         object_body_ids: if provided, only sample from these body IDs
             (typically free-joint objects). If None, samples from all
             non-world bodies.
+        prefer_body_ids: if provided, sample from these bodies first.
+            Only falls back to other valid bodies if preferred bodies
+            don't fill the budget.
 
     Returns:
         local_coords: (N, 3) body-local coords for tracking
@@ -200,7 +204,32 @@ def sample_from_image(
         valid_mask = np.isin(body_id_map, list(object_body_ids))
     else:
         valid_mask = body_id_map > 0
-    valid_ys, valid_xs = np.where(valid_mask)
+
+    if prefer_body_ids is not None and len(prefer_body_ids) > 0:
+        prefer_mask = valid_mask & np.isin(body_id_map, list(prefer_body_ids))
+        prefer_ys, prefer_xs = np.where(prefer_mask)
+        if len(prefer_ys) > 0:
+            n_prefer = min(max_points, len(prefer_ys))
+            chosen_pref = rng.choice(len(prefer_ys), size=n_prefer, replace=False)
+            leftover = max_points - n_prefer
+            if leftover > 0:
+                other_mask = valid_mask & ~prefer_mask
+                other_ys, other_xs = np.where(other_mask)
+                if len(other_ys) > 0:
+                    n_other = min(leftover, len(other_ys))
+                    chosen_other = rng.choice(len(other_ys), size=n_other, replace=False)
+                    valid_ys = np.concatenate([prefer_ys[chosen_pref], other_ys[chosen_other]])
+                    valid_xs = np.concatenate([prefer_xs[chosen_pref], other_xs[chosen_other]])
+                else:
+                    valid_ys = prefer_ys[chosen_pref]
+                    valid_xs = prefer_xs[chosen_pref]
+            else:
+                valid_ys = prefer_ys[chosen_pref]
+                valid_xs = prefer_xs[chosen_pref]
+        else:
+            valid_ys, valid_xs = np.where(valid_mask)
+    else:
+        valid_ys, valid_xs = np.where(valid_mask)
 
     if len(valid_ys) == 0:
         log.warning("No non-world body pixels visible — falling back to vertex sampling")
@@ -286,7 +315,7 @@ def _build_camera_matrices(camera, img_width: int, img_height: int):
 
 
 def track_points_for_frame(
-    data: MjData,
+    data,
     local_coords: np.ndarray,
     body_ids: np.ndarray,
     camera,
@@ -294,18 +323,22 @@ def track_points_for_frame(
     img_height: int,
     depth_frame: np.ndarray,
     occlusion_tolerance: float = 0.03,
+    precomputed_w2c: np.ndarray | None = None,
+    precomputed_intrinsics: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Compute 2D projections and visibility for all tracked points in one frame.
 
     Args:
-        data: Current MjData with updated body poses
+        data: Object with .xpos and .xmat arrays (MjData or compatible)
         local_coords: (N, 3) body-local coordinates
         body_ids: (N,) body id per point
-        camera: Camera object with pos, forward, up, fov
+        camera: Camera object (used to build matrices if precomputed not given)
         img_width: Image width in pixels
         img_height: Image height in pixels
         depth_frame: (H, W) float32 rendered depth in meters
         occlusion_tolerance: Depth comparison tolerance in meters
+        precomputed_w2c: Optional (4, 4) precomputed world-to-camera matrix
+        precomputed_intrinsics: Optional (3, 3) precomputed intrinsic matrix
 
     Returns:
         coords_2d: (N, 2) float32 pixel coordinates
@@ -314,7 +347,6 @@ def track_points_for_frame(
     """
     N = len(local_coords)
 
-    # Transform body-local to world
     world_pts = np.empty((N, 3), dtype=np.float32)
     unique_bodies = np.unique(body_ids)
     for bid in unique_bodies:
@@ -323,15 +355,15 @@ def track_points_for_frame(
         body_pos = data.xpos[bid]
         world_pts[mask] = (local_coords[mask] @ body_rot.T + body_pos).astype(np.float32)
 
-    world2cam, intrinsics = _build_camera_matrices(camera, img_width, img_height)
+    if precomputed_w2c is not None and precomputed_intrinsics is not None:
+        world2cam = precomputed_w2c
+        intrinsics = precomputed_intrinsics
+    else:
+        world2cam, intrinsics = _build_camera_matrices(camera, img_width, img_height)
 
-    # Project to camera space
     pts_h = np.hstack([world_pts, np.ones((N, 1), dtype=np.float32)])
     pts_cam = (world2cam @ pts_h.T).T[:, :3]
 
-    # cam2world from get_pose() has columns [right, -up, forward, pos].
-    # After world2cam, camera-space axes: X=right, Y=down(-up), Z=forward.
-    # Points in front of the camera have positive Z.
     depths = pts_cam[:, 2]
 
     fx, fy = intrinsics[0, 0], intrinsics[1, 1]
@@ -343,7 +375,6 @@ def track_points_for_frame(
 
     coords_2d = np.stack([px, py], axis=1).astype(np.float32)
 
-    # Visibility: in-frame + not occluded
     in_frame = (
         np.isfinite(px)
         & np.isfinite(py)
@@ -365,7 +396,6 @@ def track_points_for_frame(
             not_occluded = (point_depth - rendered_depth) < occlusion_tolerance
             visibility[in_frame_indices] = np.where(not_occluded, 1.0, 0.0)
     else:
-        # No depth available — mark in-frame points as visible (no occlusion check)
         visibility[in_frame] = 1.0
 
     return coords_2d, visibility, world_pts
@@ -375,20 +405,25 @@ def save_point_tracks(
     save_path: Path,
     trajs_2d: np.ndarray,
     visibility: np.ndarray,
-    points_3d_initial: np.ndarray,
+    points_3d_initial: np.ndarray | None,
     points_3d: np.ndarray,
     body_ids: np.ndarray,
     intrinsics: np.ndarray,
-    total_mesh_verts: int,
+    total_mesh_verts: int | None,
+    query_frames: np.ndarray | None = None,
 ) -> None:
     """Save point tracking data to a compressed npz file."""
-    np.savez_compressed(
-        save_path,
+    data = dict(
         trajs_2d=trajs_2d.astype(np.float32),
         visibility=visibility.astype(np.float32),
-        points_3d_initial=points_3d_initial.astype(np.float32),
         points_3d=points_3d.astype(np.float32),
         body_ids=body_ids.astype(np.int32),
         intrinsics=intrinsics.astype(np.float32),
-        num_sampled_from=np.array(total_mesh_verts, dtype=np.int32),
     )
+    if points_3d_initial is not None:
+        data["points_3d_initial"] = points_3d_initial.astype(np.float32)
+    if total_mesh_verts is not None:
+        data["num_sampled_from"] = np.array(total_mesh_verts, dtype=np.int32)
+    if query_frames is not None:
+        data["query_frames"] = np.asarray(query_frames, dtype=np.int32)
+    np.savez_compressed(save_path, **data)
