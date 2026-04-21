@@ -6,6 +6,7 @@ for use in the data generation pipeline.
 """
 
 import math
+import random
 from pathlib import Path
 
 from molmo_spaces.configs import BasePolicyConfig, BaseRobotConfig
@@ -26,6 +27,7 @@ from molmo_spaces.configs.camera_configs import (
     FrankaRandomizedD405D455CameraSystem,
     FrankaRandomizedDroidCameraSystem,
     RBY1GoProD455CameraSystem,
+    RBY1OmniPurposeCameraSystem,
 )
 from molmo_spaces.configs.policy_configs import (
     CuroboOpenClosePlannerPolicyConfig,
@@ -81,12 +83,13 @@ class FrankaPickDroidDataGenConfig(PickBaseConfig):
 class FrankaPickPointTrackDebug(PickBaseConfig):
     """Point tracking generation at scale."""
 
+    scene_dataset: str = "procthor-objaverse"
     robot_config: BaseRobotConfig = FrankaRobotConfig()
-    camera_config: FrankaDroidCameraSystem = FrankaDroidCameraSystem()
+    camera_config: FrankaOmniPurposeCameraSystem = FrankaOmniPurposeCameraSystem()
     output_dir: Path = ASSETS_DIR / "experiment_output" / "datagen" / "pick_point_track"
     task_sampler_config: PickTaskSamplerConfig = PickTaskSamplerConfig(
         task_sampler_class=PickTaskSampler,
-        house_inds=list(range(3)),
+        house_inds=random.sample(range(99925), k=3000),
         samples_per_house=10,
     )
     num_workers: int = 8
@@ -107,19 +110,20 @@ class FrankaPickPointTrackDebug(PickBaseConfig):
 class FrankaPickAndPlacePointTrack(PickAndPlaceDataGenConfig):
     """Pick-and-place with point tracking."""
 
+    scene_dataset: str = "procthor-objaverse"
     robot_config: BaseRobotConfig = FrankaRobotConfig()
-    camera_config: FrankaDroidCameraSystem = FrankaDroidCameraSystem()
+    camera_config: FrankaOmniPurposeCameraSystem = FrankaOmniPurposeCameraSystem()
     output_dir: Path = ASSETS_DIR / "experiment_output" / "datagen" / "pick_and_place_point_track"
     task_sampler_config: PickAndPlaceTaskSamplerConfig = PickAndPlaceTaskSamplerConfig(
         task_sampler_class=PickAndPlaceTaskSampler,
-        house_inds=list(range(10)),
-        samples_per_house=5,
+        house_inds=random.sample(range(99925), k=3000),
+        samples_per_house=10,
     )
-    num_workers: int = 1
+    num_workers: int = 8
     use_wandb: bool = False
     filter_for_successful_trajectories: bool = False
     generate_point_tracks: bool = True
-    point_track_num_points: int = 256
+    point_track_num_points: int = 5000
     point_track_sampling: str = "image"
     point_track_query_interval: int = 20
     point_tracks_only: bool = True
@@ -133,8 +137,9 @@ class FrankaPickAndPlacePointTrack(PickAndPlaceDataGenConfig):
 class CoTracker3Eval(PickBaseConfig):
     """Eval set for CoTracker3: 60 videos, 30 point tracks each."""
 
+    scene_dataset: str = "procthor-objaverse"
     robot_config: BaseRobotConfig = FrankaRobotConfig()
-    camera_config: FrankaDroidCameraSystem = FrankaDroidCameraSystem()
+    camera_config: FrankaOmniPurposeCameraSystem = FrankaOmniPurposeCameraSystem()
     output_dir: Path = Path("/gpfs/scrubbed/yunbos/video_datasets/cotracker3-eval-datasets/molmospaces")
     task_sampler_config: PickTaskSamplerConfig = PickTaskSamplerConfig(
         task_sampler_class=PickTaskSampler,
@@ -548,13 +553,15 @@ class RBY1PickDataGenConfig(PickBaseConfig):
 class RBY1PickPointTrack(RBY1PickDataGenConfig):
     """RBY1 pick task with point tracking."""
 
+    scene_dataset: str = "procthor-objaverse"
+    camera_config: RBY1OmniPurposeCameraSystem = RBY1OmniPurposeCameraSystem()
     output_dir: Path = ASSETS_DIR / "experiment_output" / "datagen" / "rby1_pick_point_track"
     task_sampler_config: PickTaskSamplerConfig = PickTaskSamplerConfig(
         task_sampler_class=PickTaskSampler,
-        house_inds=list(range(10)),
-        samples_per_house=50,
+        house_inds=random.sample(range(99925), k=3000),
+        samples_per_house=10,
     )
-    num_workers: int = 3
+    num_workers: int = 4
     use_wandb: bool = False
     filter_for_successful_trajectories: bool = False
     generate_point_tracks: bool = True
@@ -566,6 +573,42 @@ class RBY1PickPointTrack(RBY1PickDataGenConfig):
     @property
     def tag(self) -> str:
         return "rby1_pick_point_track"
+
+
+@register_config("RUMPickPointTrack")
+class RUMPickPointTrack(PickBaseConfig):
+    """RUM (floating gripper) pick task with point tracking.
+
+    Uses the RUM-compatible camera system (wrist_cam + 2 free-floating
+    randomized exocentric cams); the Franka/RBY1 "OmniPurpose" rigs are
+    hard-coded to Franka body names (e.g. fr3_link0) that RUM lacks.
+    """
+
+    scene_dataset: str = "holodeck-objaverse"
+    robot_config: FloatingRUMRobotConfig = FloatingRUMRobotConfig()
+    camera_config: FrankaRandomizedD405D455CameraSystem = FrankaRandomizedD405D455CameraSystem(
+        img_resolution=(960, 720)
+    )
+    output_dir: Path = ASSETS_DIR / "experiment_output" / "datagen" / "rum_pick_point_track"
+    task_sampler_config: RUMPickTaskSamplerConfig = RUMPickTaskSamplerConfig(
+        task_sampler_class=PickTaskSampler,
+        house_inds=random.sample(range(99925), k=3000),
+        samples_per_house=10,
+        robot_object_z_offset=0,
+    )
+    policy_config: PickPlannerPolicyConfig = PickPlannerPolicyConfig()
+    num_workers: int = 8
+    use_wandb: bool = False
+    filter_for_successful_trajectories: bool = False
+    generate_point_tracks: bool = True
+    point_track_num_points: int = 5000
+    point_track_sampling: str = "image"
+    point_track_query_interval: int = 20
+    point_tracks_only: bool = True
+
+    @property
+    def tag(self) -> str:
+        return "rum_pick_point_track"
 
 
 @register_config("FrankaCloseDataGenConfig")

@@ -106,6 +106,13 @@ class MlSpacesExpConfig(Config, ABC):
     point_track_sampling: str = "vertex"  # "vertex" or "image"
     point_track_query_interval: int = 0  # 0 = all points from frame 0; N>0 = preview mode
     point_tracks_only: bool = False  # skip HDF5/depth/robot-state sensors, keep only RGB + point tracks
+    # When True (and point_track_sampling=="image"), reserve a fraction of the
+    # point budget for static scene geometry (walls, floor, furniture) in
+    # addition to the usual trackable bodies (free-joint objects + robot).
+    # Background points are still tracked rigidly, but since their bodies are
+    # static the trajectories collapse to camera-motion-only signal.
+    point_track_include_background: bool = False
+    point_track_background_fraction: float = 0.25
 
     def model_post_init(self, _context) -> None:
         """This serves as the __init__() called after internal validation of config parameters"""

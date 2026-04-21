@@ -297,6 +297,73 @@ class RBY1GoProD455CameraSystem(CameraSystemConfig):
     ]
 
 
+class RBY1OmniPurposeCameraSystem(CameraSystemConfig):
+    """Camera system for RBY1 with built-in MJCF cameras (head + wrists) plus
+    randomized exocentric cameras for viewpoint diversity."""
+
+    img_resolution: tuple[int, int] = (624, 352)
+    cameras: list[AllCameraTypes] = [
+        MjcfCameraConfig(
+            name="head_camera",
+            mjcf_name="head_camera",
+            robot_namespace="robot_0/",
+            fov=70.0,
+            fov_noise_degrees=(-3.0, 3.0),
+            pos_noise_range=((-0.01, -0.01, -0.01), (0.01, 0.01, 0.01)),
+            orientation_noise_degrees=(4.0, 4.0, 4.0),
+            skip_erosion=True,
+        ),
+        MjcfCameraConfig(
+            name="wrist_camera_l",
+            mjcf_name="wrist_camera_l",
+            robot_namespace="robot_0/",
+            fov=58.0,
+            fov_noise_degrees=(-4.0, 4.0),
+            pos_noise_range=((-0.015, -0.005, -0.01), (0.015, 0.005, 0.01)),
+            orientation_noise_degrees=(8.0, 4.0, 4.0),
+            record_depth=True,
+        ),
+        MjcfCameraConfig(
+            name="wrist_camera_r",
+            mjcf_name="wrist_camera_r",
+            robot_namespace="robot_0/",
+            fov=58.0,
+            fov_noise_degrees=(-4.0, 4.0),
+            pos_noise_range=((-0.015, -0.005, -0.01), (0.015, 0.005, 0.01)),
+            orientation_noise_degrees=(8.0, 4.0, 4.0),
+            record_depth=True,
+        ),
+        RandomizedExocentricCameraConfig(
+            name="randomized_zed2_analogue_1",
+            distance_range=(0.6, 1.8),
+            height_range=(0.3, 1.4),
+            azimuth_range=(0, 2 * np.pi),
+            fov_range=(64, 72),
+            lookat_noise_range=(-0.15, 0.15),
+            visibility_constraints={
+                "__task_objects__": 0.0001,
+                "__gripper__": 0.0001,
+            },
+            max_placement_attempts=100,
+            allow_relaxed_constraints=True,
+        ),
+        RandomizedExocentricCameraConfig(
+            name="randomized_zed2_analogue_2",
+            distance_range=(0.6, 1.8),
+            height_range=(0.3, 1.4),
+            azimuth_range=(0, 2 * np.pi),
+            fov_range=(64, 72),
+            lookat_noise_range=(-0.15, 0.15),
+            visibility_constraints={
+                "__task_objects__": 0.0001,
+                "__gripper__": 0.0001,
+            },
+            max_placement_attempts=100,
+            allow_relaxed_constraints=True,
+        ),
+    ]
+
+
 class FrankaRandomizedD405D455CameraSystem(CameraSystemConfig):
     """Camera system for Franka pick-and-place tasks with wrist cam and 2 randomized exo cams.
 
@@ -470,8 +537,8 @@ class FrankaOmniPurposeCameraSystem(CameraSystemConfig):
         # Two randomized exocentric cameras positioned around workspace center
         RandomizedExocentricCameraConfig(
             name="randomized_zed2_analogue_1",
-            distance_range=(0.2, 0.8),
-            height_range=(0.05, 0.6),
+            distance_range=(0.6, 1.2),
+            height_range=(0.15, 0.7),
             azimuth_range=(0, 2 * np.pi),
             fov_range=(64, 72),
             lookat_noise_range=(-0.1, 0.1),
@@ -484,8 +551,8 @@ class FrankaOmniPurposeCameraSystem(CameraSystemConfig):
         ),
         RandomizedExocentricCameraConfig(
             name="randomized_zed2_analogue_2",
-            distance_range=(0.2, 0.8),
-            height_range=(0.05, 0.6),
+            distance_range=(0.6, 1.2),
+            height_range=(0.15, 0.7),
             azimuth_range=(0, 2 * np.pi),
             fov_range=(64, 72),
             lookat_noise_range=(-0.1, 0.1),
@@ -498,8 +565,8 @@ class FrankaOmniPurposeCameraSystem(CameraSystemConfig):
         ),
         RandomizedExocentricCameraConfig(
             name="randomized_gopro_analogue_1",
-            distance_range=(0.2, 0.5),
-            height_range=(0.1, 0.6),
+            distance_range=(0.45, 0.8),
+            height_range=(0.2, 0.7),
             azimuth_range=(0, 2 * np.pi),
             fov_range=(137, 140),  # GoPro vertical FOV
             is_warped=False,  # NOTE: baked in warping not yet implemented
@@ -942,6 +1009,7 @@ class FrankaEvalCameraSystem(CameraSystemConfig):
 AllCameraSystems: TypeAlias = (
     RBY1MjcfCameraSystem
     | RBY1GoProD455CameraSystem
+    | RBY1OmniPurposeCameraSystem
     | FrankaRandomizedD405D455CameraSystem
     | FrankaEasyRandomizedDroidCameraSystem
     | FrankaDroidCameraSystem

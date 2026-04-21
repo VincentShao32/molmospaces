@@ -465,34 +465,34 @@ class CPUMujocoEnv(BaseMujocoEnv):
         if len(target_objects) == 0:
             raise ValueError("At least one target object must be provided")
 
-        try:
-            # Render segmentation frame once for all objects
-            seg_frame = self.render_segmentation_frame(camera_name)
+        # try:
+        # Render segmentation frame once for all objects
+        seg_frame = self.render_segmentation_frame(camera_name)
 
-            results = {}
-            # Check visibility for each target object
-            for obj_name in target_objects:
-                try:
-                    visibility = self.segmentation_fraction(seg_frame, obj_name)
-                    results[obj_name] = visibility
-                except ValueError:
-                    results[obj_name] = 0.0
+        results = {}
+        # Check visibility for each target object
+        for obj_name in target_objects:
+            try:
+                visibility = self.segmentation_fraction(seg_frame, obj_name)
+                results[obj_name] = visibility
+            except ValueError:
+                results[obj_name] = 0.0
 
-            # Return single float if only one object, dict if multiple
-            if len(target_objects) == 1:
-                return results[target_objects[0]]
-            else:
-                return results
+        # Return single float if only one object, dict if multiple
+        if len(target_objects) == 1:
+            return results[target_objects[0]]
+        else:
+            return results
 
-        except Exception as e:
-            # Return 0 visibility for all objects if camera render fails
-            log.warning(
-                f"[VISIBILITY CHECK] Failed to check visibility for camera {camera_name}: {e}"
-            )
-            if len(target_objects) == 1:
-                return 0.0
-            else:
-                return {obj_name: 0.0 for obj_name in target_objects}
+        # except Exception as e:
+        #     # Return 0 visibility for all objects if camera render fails
+        #     log.warning(
+        #         f"[VISIBILITY CHECK] Failed to check visibility for camera {camera_name}: {e}"
+        #     )
+        #     if len(target_objects) == 1:
+        #         return 0.0
+        #     else:
+        #         return {obj_name: 0.0 for obj_name in target_objects}
 
     def check_camera_visibility_constraints(
         self,
@@ -563,54 +563,54 @@ class CPUMujocoEnv(BaseMujocoEnv):
                 continue
 
             # Check visibility for all objects
-            try:
-                visibility_results = self.check_visibility(
-                    camera_name, *resolved_constraints.keys()
-                )
+            # try:
+            visibility_results = self.check_visibility(
+                camera_name, *resolved_constraints.keys()
+            )
 
-                # Convert to dict if single object
-                if not isinstance(visibility_results, dict):
-                    visibility_results = {list(resolved_constraints.keys())[0]: visibility_results}
+            # Convert to dict if single object
+            if not isinstance(visibility_results, dict):
+                visibility_results = {list(resolved_constraints.keys())[0]: visibility_results}
 
-                detailed_results[camera_name] = visibility_results
+            detailed_results[camera_name] = visibility_results
 
-                # Save frame if directory specified
-                if save_frames_dir is not None:
-                    try:
-                        import time
+            # Save frame if directory specified
+            if save_frames_dir is not None:
+                try:
+                    import time
 
-                        from PIL import Image
+                    from PIL import Image
 
-                        rgb_frame = self.render_rgb_frame(camera_name)
-                        # Convert from float [0,1] to uint8 if needed
-                        if rgb_frame.dtype == np.float32 or rgb_frame.dtype == np.float64:
-                            rgb_frame = (rgb_frame * 255).astype(np.uint8)
-                        img = Image.fromarray(rgb_frame)
-                        # Add timestamp to filename to avoid overwriting
-                        timestamp = int(time.time() * 1000)
-                        frame_path = visibility_frames_dir / f"{camera_name}_{timestamp}.png"
-                        img.save(frame_path)
-                        log.debug(f"[VISIBILITY CHECK] Saved frame to {frame_path}")
-                    except Exception as e:
-                        log.warning(
-                            f"[VISIBILITY CHECK] Failed to save frame for camera '{camera_name}': {e}"
-                        )
+                    rgb_frame = self.render_rgb_frame(camera_name)
+                    # Convert from float [0,1] to uint8 if needed
+                    if rgb_frame.dtype == np.float32 or rgb_frame.dtype == np.float64:
+                        rgb_frame = (rgb_frame * 255).astype(np.uint8)
+                    img = Image.fromarray(rgb_frame)
+                    # Add timestamp to filename to avoid overwriting
+                    timestamp = int(time.time() * 1000)
+                    frame_path = visibility_frames_dir / f"{camera_name}_{timestamp}.png"
+                    img.save(frame_path)
+                    log.debug(f"[VISIBILITY CHECK] Saved frame to {frame_path}")
+                except Exception as e:
+                    log.warning(
+                        f"[VISIBILITY CHECK] Failed to save frame for camera '{camera_name}': {e}"
+                    )
 
-                # Check if all constraints are satisfied for this camera
-                for obj_name, threshold in resolved_constraints.items():
-                    actual_visibility = visibility_results.get(obj_name, 0.0)
-                    if actual_visibility < threshold:
-                        all_satisfied = False
-                        log.debug(
-                            f"[VISIBILITY CHECK] Camera '{camera_name}': object '{obj_name}' "
-                            f"visibility {actual_visibility:.5f} < threshold {threshold:.5f}"
-                        )
+            # Check if all constraints are satisfied for this camera
+            for obj_name, threshold in resolved_constraints.items():
+                actual_visibility = visibility_results.get(obj_name, 0.0)
+                if actual_visibility < threshold:
+                    all_satisfied = False
+                    log.debug(
+                        f"[VISIBILITY CHECK] Camera '{camera_name}': object '{obj_name}' "
+                        f"visibility {actual_visibility:.5f} < threshold {threshold:.5f}"
+                    )
 
-            except Exception as e:
-                log.warning(
-                    f"[VISIBILITY CHECK] Failed to check visibility for camera '{camera_name}': {e}"
-                )
-                all_satisfied = False
+            # except Exception as e:
+            #     log.warning(
+            #         f"[VISIBILITY CHECK] Failed to check visibility for camera '{camera_name}': {e}"
+            #     )
+            #     all_satisfied = False
 
         return all_satisfied, detailed_results
 

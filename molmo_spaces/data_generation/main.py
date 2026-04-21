@@ -6,6 +6,7 @@ import os
 
 from molmo_spaces.data_generation.config_registry import get_config_class
 from molmo_spaces.data_generation.pipeline import ParallelRolloutRunner
+from molmo_spaces.utils.cache_verifier import verify_and_repair_at_startup
 
 """
 Main script entry for data generation.
@@ -76,8 +77,10 @@ def auto_import_configs() -> None:
 
 
 def main() -> None:
+    print("[BOOT] entering main()", flush=True)
     args = get_args()
     exp_config_cls = args.exp_config_cls
+    print(f"[BOOT] parsed args, config={exp_config_cls}", flush=True)
 
     # np.random.seed(42)
 
@@ -87,16 +90,21 @@ def main() -> None:
         exp_config_module, exp_config_cls = exp_config_cls.split(":")
         importlib.import_module(exp_config_module)
     else:  # otherwise, auto-import all config files to populate the registry
+        print("[BOOT] auto-importing configs...", flush=True)
         auto_import_configs()
+        print("[BOOT] auto-import done", flush=True)
 
     # Get the config class from the registry
     ExpConfigClass = get_config_class(exp_config_cls)
+    print(f"[BOOT] got config class: {ExpConfigClass.__name__}", flush=True)
     # NOTE: You may optionally load additional exp_config arguments from argparse command line
     exp_config_args = vars(args)
     # pop exp_config_cls from args
     exp_config_args.pop("exp_config_cls")
     # Create exp_config instance with args
+    print("[BOOT] instantiating exp_config...", flush=True)
     exp_config = ExpConfigClass(**exp_config_args)
+    print("[BOOT] exp_config instantiated", flush=True)
 
     # Optional: Modify the config parameters here if needed
     # Eg. for hyperparamter sweeps etc.
@@ -119,7 +127,9 @@ def main() -> None:
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         exp_config.output_dir = exp_config.output_dir / exp_config_name / timestamp
 
+    print(f"[BOOT] creating output dir: {exp_config.output_dir}", flush=True)
     os.makedirs(exp_config.output_dir, exist_ok=True)
+    print("[BOOT] output dir ready", flush=True)
 
     # Initialize wandb if enabled - with auto run name
     if exp_config.use_wandb:
@@ -133,10 +143,19 @@ def main() -> None:
             project=exp_config.wandb_project, name=exp_config.wandb_name, config=vars(exp_config)
         )
 
+    print("[BOOT] saving config...", flush=True)
     exp_config.save_config()
+    print("[BOOT] config saved", flush=True)
+
+    # Self-heal any partially-extracted resource cache entries before workers
+    # boot. Cheap (just Path.exists) and prevents silent worker death from
+    # missing .obj/.png files left behind by a previously-killed extract.
+    verify_and_repair_at_startup()
 
     # Create rollout runner with the set config parameters
+    print("[BOOT] constructing ParallelRolloutRunner...", flush=True)
     runner = ParallelRolloutRunner(exp_config)
+    print("[BOOT] runner constructed, calling run()", flush=True)
 
     success_count, total_count = runner.run()
     print(f"Success count: {success_count}, Total count: {total_count}")

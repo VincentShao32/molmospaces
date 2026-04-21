@@ -167,6 +167,8 @@ def sample_from_image(
     seed: int = 0,
     object_body_ids: set[int] | None = None,
     prefer_body_ids: set[int] | None = None,
+    background_body_ids: set[int] | None = None,
+    background_fraction: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
     """Sample tracked points by picking visible pixels on objects.
 
@@ -186,10 +188,23 @@ def sample_from_image(
         seed: random seed
         object_body_ids: if provided, only sample from these body IDs
             (typically free-joint objects). If None, samples from all
-            non-world bodies.
+            non-world bodies. Ignored for pixels belonging to
+            ``background_body_ids`` when a background budget is requested.
         prefer_body_ids: if provided, sample from these bodies first.
             Only falls back to other valid bodies if preferred bodies
             don't fill the budget.
+        background_body_ids: if provided together with a positive
+            ``background_fraction``, reserve ``background_fraction * max_points``
+            points for pixels whose body is in this set. When ``None`` (the
+            default) no explicit background budget is reserved — the sampler
+            behaves as before. When set to an empty set, the complement of
+            ``object_body_ids`` (i.e. all non-world bodies that are *not*
+            trackable) is used.
+        background_fraction: fraction of the budget to reserve for background
+            bodies. Clamped to ``[0, 1]``. Ignored unless
+            ``background_body_ids`` is not ``None``. If the requested
+            background quota can't be filled (e.g. no background visible),
+            the leftover is returned to the foreground budget.
 
     Returns:
         local_coords: (N, 3) body-local coords for tracking
@@ -200,6 +215,103 @@ def sample_from_image(
     rng = np.random.RandomState(seed)
 
     body_id_map = seg_frame[:, :, 2]  # (H, W) body id per pixel
+
+    want_background_split = (
+        background_body_ids is not None and background_fraction > 0.0
+    )
+    if want_background_split:
+        background_fraction = float(np.clip(background_fraction, 0.0, 1.0))
+
+        # Empty set => "everything that's a body but not in object_body_ids".
+        # Non-empty => use explicitly-listed background bodies (rare, but useful
+        # if a caller wants to restrict background to e.g. walls-only).
+        if len(background_body_ids) == 0:
+            all_body_mask = body_id_map > 0
+            if object_body_ids is not None:
+                bg_mask = all_body_mask & ~np.isin(
+                    body_id_map, list(object_body_ids)
+                )
+            else:
+                # object_body_ids=None means "everything goes to foreground",
+                # so there's no implicit complement to draw background from.
+                # Caller should pass an explicit set in this case.
+                bg_mask = np.zeros_like(all_body_mask)
+        else:
+            bg_mask = np.isin(body_id_map, list(background_body_ids))
+
+        if object_body_ids is not None:
+            fg_mask = np.isin(body_id_map, list(object_body_ids)) & ~bg_mask
+        else:
+            fg_mask = (body_id_map > 0) & ~bg_mask
+
+        # Budget split: background gets its requested share, foreground gets
+        # the rest (including any leftover when background can't be filled).
+        n_bg_target = int(round(max_points * background_fraction))
+        bg_ys, bg_xs = np.where(bg_mask)
+        n_bg = min(n_bg_target, len(bg_ys))
+        n_fg_target = max_points - n_bg
+
+        if prefer_body_ids is not None and len(prefer_body_ids) > 0:
+            prefer_pix_mask = fg_mask & np.isin(body_id_map, list(prefer_body_ids))
+            other_fg_mask = fg_mask & ~prefer_pix_mask
+            pref_ys, pref_xs = np.where(prefer_pix_mask)
+            oth_ys, oth_xs = np.where(other_fg_mask)
+            n_pref = min(n_fg_target, len(pref_ys))
+            n_oth = min(n_fg_target - n_pref, len(oth_ys))
+            fg_ys_list, fg_xs_list = [], []
+            if n_pref > 0:
+                cp = rng.choice(len(pref_ys), size=n_pref, replace=False)
+                fg_ys_list.append(pref_ys[cp])
+                fg_xs_list.append(pref_xs[cp])
+            if n_oth > 0:
+                co = rng.choice(len(oth_ys), size=n_oth, replace=False)
+                fg_ys_list.append(oth_ys[co])
+                fg_xs_list.append(oth_xs[co])
+            fg_ys_picked = (
+                np.concatenate(fg_ys_list) if fg_ys_list else np.empty(0, dtype=int)
+            )
+            fg_xs_picked = (
+                np.concatenate(fg_xs_list) if fg_xs_list else np.empty(0, dtype=int)
+            )
+        else:
+            fg_ys_all, fg_xs_all = np.where(fg_mask)
+            n_fg = min(n_fg_target, len(fg_ys_all))
+            if n_fg > 0:
+                cf = rng.choice(len(fg_ys_all), size=n_fg, replace=False)
+                fg_ys_picked = fg_ys_all[cf]
+                fg_xs_picked = fg_xs_all[cf]
+            else:
+                fg_ys_picked = np.empty(0, dtype=int)
+                fg_xs_picked = np.empty(0, dtype=int)
+
+        if n_bg > 0:
+            cb = rng.choice(len(bg_ys), size=n_bg, replace=False)
+            bg_ys_picked = bg_ys[cb]
+            bg_xs_picked = bg_xs[cb]
+        else:
+            bg_ys_picked = np.empty(0, dtype=int)
+            bg_xs_picked = np.empty(0, dtype=int)
+
+        valid_ys = np.concatenate([fg_ys_picked, bg_ys_picked])
+        valid_xs = np.concatenate([fg_xs_picked, bg_xs_picked])
+
+        if len(valid_ys) == 0:
+            log.warning("No non-world body pixels visible — falling back to vertex sampling")
+            return sample_mesh_vertices(model, data, max_points, seed)
+
+        # Skip the downstream "pick n_pick from valid_ys" step: valid_{ys,xs}
+        # is already the final sampled set.
+        pxs = valid_xs
+        pys = valid_ys
+        pixel_bids = body_id_map[pys, pxs]
+        pixel_depths = depth_frame[pys, pxs]
+
+        return _unproject_and_localize(
+            model, data, camera, img_width, img_height,
+            pxs, pys, pixel_bids, pixel_depths, seed,
+        )
+
+    # --- Single-budget path (original behavior, kept for back-compat) ---
     if object_body_ids is not None:
         valid_mask = np.isin(body_id_map, list(object_body_ids))
     else:
@@ -242,24 +354,44 @@ def sample_from_image(
     pixel_bids = body_id_map[pys, pxs]
     pixel_depths = depth_frame[pys, pxs]
 
-    # Unproject pixels to 3D world coordinates
+    return _unproject_and_localize(
+        model, data, camera, img_width, img_height,
+        pxs, pys, pixel_bids, pixel_depths, seed,
+    )
+
+
+def _unproject_and_localize(
+    model: MjModel,
+    data: MjData,
+    camera,
+    img_width: int,
+    img_height: int,
+    pxs: np.ndarray,
+    pys: np.ndarray,
+    pixel_bids: np.ndarray,
+    pixel_depths: np.ndarray,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """Unproject picked pixels to world, convert to body-local, count meshes.
+
+    Shared tail for the single-budget and background-split paths of
+    :func:`sample_from_image`.
+    """
     cam2world = camera.get_pose()
     fovy_rad = np.radians(camera.fov)
     fy = (img_height / 2.0) / np.tan(fovy_rad / 2.0)
     fx = fy
     cx, cy = img_width / 2.0, img_height / 2.0
 
-    # Camera-space 3D (X=right, Y=down, Z=forward)
     cam_x = (pxs.astype(np.float64) - cx) / fx * pixel_depths
     cam_y = (pys.astype(np.float64) - cy) / fy * pixel_depths
     cam_z = pixel_depths.astype(np.float64)
-    pts_cam = np.stack([cam_x, cam_y, cam_z], axis=1)  # (N, 3)
+    pts_cam = np.stack([cam_x, cam_y, cam_z], axis=1)
 
     R = cam2world[:3, :3]
     t = cam2world[:3, 3]
     world_pts = (pts_cam @ R.T + t).astype(np.float32)
 
-    # Count total mesh verts for metadata
     total_verts = 0
     for geom_id in range(model.ngeom):
         if model.geom_type[geom_id] != mujoco.mjtGeom.mjGEOM_MESH.value:
@@ -268,9 +400,7 @@ def sample_from_image(
             continue
         total_verts += model.mesh_vertnum[model.geom_dataid[geom_id]]
 
-    # Convert world points to body-local coordinates for rigid tracking.
-    # Uses the exact unprojected surface point (no vertex snapping) so
-    # every point is guaranteed visible in the sampling frame.
+    n_pick = len(pxs)
     local_coords = np.empty((n_pick, 3), dtype=np.float32)
     final_bids = pixel_bids.astype(np.int32)
 

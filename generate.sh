@@ -11,4 +11,4 @@ export MUJOCO_GL=egl
 export PYOPENGL_PLATFORM=egl
 export MUJOCO_INSTALL_DIR=/gpfs/scrubbed/yunbos/video_datasets/molmospaces/assets/
 
-python -m ipdb -m molmo_spaces.data_generation.main FrankaPickPointTrackDebug 2>&1 | tee "$LOG_FILE"
+python -m molmo_spaces.data_generation.mixture_main RUMPickPointTrackOnly 2>&1 | tee "$LOG_FILE"

@@ -830,6 +830,20 @@ class ParallelRolloutRunner:
 
             if exp_config.camera_config is not None:
                 obj_bids = get_trackable_body_ids(env.mj_model) if pt_sampling == "image" else None
+                # Background-pixel sampling uses the complement of obj_bids
+                # (static scene geometry) and is only active for image sampling
+                # when the config explicitly opts in.
+                pt_bg_bids: set[int] | None = (
+                    set()
+                    if (
+                        pt_sampling == "image"
+                        and getattr(exp_config, "point_track_include_background", False)
+                    )
+                    else None
+                )
+                pt_bg_fraction: float = float(
+                    getattr(exp_config, "point_track_background_fraction", 0.0)
+                )
                 for cam_cfg in exp_config.camera_config.cameras:
                     cam_entry = {
                         "trajs_2d": [],
@@ -852,6 +866,8 @@ class ParallelRolloutRunner:
                                 max_points=total_budget,
                                 seed=episode_seed,
                                 object_body_ids=obj_bids,
+                                background_body_ids=pt_bg_bids,
+                                background_fraction=pt_bg_fraction,
                             )
                             cam_entry["local_coords"] = lc
                             cam_entry["body_ids"] = bi
@@ -893,6 +909,8 @@ class ParallelRolloutRunner:
                         max_points=total_budget,
                         seed=episode_seed,
                         object_body_ids=obj_bids,
+                        background_body_ids=pt_bg_bids,
+                        background_fraction=pt_bg_fraction,
                     )
                     if len(cand_lc) > 0:
                         cam_data["_candidates_lc"].append(cand_lc)
@@ -988,6 +1006,8 @@ class ParallelRolloutRunner:
                                 max_points=total_budget,
                                 seed=episode_seed + frame_idx,
                                 object_body_ids=obj_bids,
+                                background_body_ids=pt_bg_bids,
+                                background_fraction=pt_bg_fraction,
                             )
                             if len(cand_lc) > 0:
                                 cam_data["_candidates_lc"].append(cand_lc)
