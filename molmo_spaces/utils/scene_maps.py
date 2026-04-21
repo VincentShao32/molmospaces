@@ -9,16 +9,30 @@ import cv2
 import matplotlib.pyplot as plt
 import mujoco
 import numpy as np
-from mujoco import MjData
+from mujoco import MjData, MjModel
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
 
 from molmo_spaces.env.mj_extensions import MjModelBindings
+from molmo_spaces.renderer.filament_rendering import MjFilamentRenderer
 from molmo_spaces.renderer.opengl_rendering import MjOpenGLRenderer
 from molmo_spaces.utils.linalg_utils import homogenize, inverse_homogeneous_matrix, single_or_batch
 from molmo_spaces.utils.mj_model_and_data_utils import geom_aabb
 
 log = logging.getLogger(__name__)
+
+
+def _get_renderer(
+    model: MjModel, width: int, height: int, device_id: int, use_filament: bool = False
+) -> MjOpenGLRenderer | MjFilamentRenderer:
+    renderer: MjOpenGLRenderer | MjFilamentRenderer | None = None
+    if use_filament:
+        renderer = MjFilamentRenderer(MjModelBindings(model), height=height, width=width)
+    else:
+        renderer = MjOpenGLRenderer(
+            MjModelBindings(model), height=height, width=width, device_id=device_id
+        )
+    return renderer
 
 
 def _delete_blacklisted_bodies(spec: mujoco.MjSpec) -> int:
@@ -133,6 +147,7 @@ class THORMap:
         voxel_map=None,
         voxel_scale_factor=None,
         px_per_m: int = 100,
+        use_filament: bool = False,
     ):
         self._occupancy_map = occupancy_map
         self._occupancy_scale_factor = occupancy_scale_factor
@@ -140,6 +155,7 @@ class THORMap:
         self._voxel_map = voxel_map
         self._voxel_scale_factor = voxel_scale_factor
         self._px_per_m = px_per_m
+        self._use_filament = use_filament
 
     @property
     def occupancy_map(self):
@@ -294,8 +310,9 @@ class ProcTHORMap(THORMap):
         px_per_m: int,
         room_map: np.ndarray = None,
         room_ids_to_name: dict = None,
+        use_filament: bool = False,
     ):
-        super().__init__(occupancy_map=occupancy, px_per_m=px_per_m)
+        super().__init__(occupancy_map=occupancy, px_per_m=px_per_m, use_filament=use_filament)
         self.occupancy = occupancy
         self._room_map = room_map
         self.room_ids_to_name = room_ids_to_name
@@ -376,7 +393,7 @@ class ProcTHORMap(THORMap):
         return self._px_per_m
 
     @classmethod
-    def load(cls, path: str):
+    def load(cls, path: str, agent_radius: float | None = None):
         if path.endswith(".png"):
             # stacked images
             all_img = Image.open(path)
@@ -391,6 +408,15 @@ class ProcTHORMap(THORMap):
             room_ids_to_name = {int(k): v for k, v in room_ids_to_name.items()}
             occupancy = np.array(img) > 0
             room_map = np.array(room_map)
+
+            if agent_radius is not None:
+                occupancy = ~occupancy
+                rad_px = int(agent_radius * px_per_m)
+                kernel = circular_kernel(rad_px)
+                occupancy = cv2.dilate(occupancy.astype(np.uint8), kernel).astype(bool)
+                room_map[occupancy] = 0
+                occupancy = ~occupancy
+
             return cls(
                 occupancy=occupancy,
                 room_map=room_map,
@@ -401,9 +427,25 @@ class ProcTHORMap(THORMap):
             )
         elif path.endswith(".npz"):
             data = np.load(path)
+
+            world_to_map = data["world_to_map"]
+            map_to_world = data["map_to_world"]
+            px_per_m = data["px_per_m"]
+            room_ids_to_name = data["room_ids_to_name"]
+            occupancy = data["occupancy"]
+            room_map = data["occupancy"]
+
+            if agent_radius is not None:
+                occupancy = ~occupancy
+                rad_px = int(agent_radius * px_per_m)
+                kernel = circular_kernel(rad_px)
+                occupancy = cv2.dilate(occupancy.astype(np.uint8), kernel).astype(bool)
+                room_map[occupancy] = 0
+                occupancy = ~occupancy
+
             return cls(
-                occupancy=data["occupancy"],
-                room_map=data["room_map"],
+                occupancy=occupancy,
+                room_map=room_map,
                 room_ids_to_name=data["room_ids_to_name"],
                 world_to_map=data["world_to_map"],
                 map_to_world=data["map_to_world"],
@@ -421,6 +463,7 @@ class ProcTHORMap(THORMap):
         px_per_m: int = 100,
         data: MjData | None = None,
         device_id: int = None,
+        use_filament: bool = False,
     ):
         """
         Generate a ProcTHORMap from a MuJoCo model with the open door path cleared.
@@ -564,8 +607,8 @@ class ProcTHORMap(THORMap):
             w = round(px_per_m * aabb_size[1])
             effective_px = h / aabb_size[0]
 
-            renderer = MjOpenGLRenderer(
-                MjModelBindings(model), height=h, width=w, device_id=device_id
+            renderer = _get_renderer(
+                model, width=w, height=h, device_id=device_id, use_filament=use_filament
             )
             renderer.update(data, cam)
             for camera in renderer.scene.camera:
@@ -814,6 +857,7 @@ class iTHORMap(ProcTHORMap):
         px_per_m: int = 100,
         data: MjData | None = None,
         device_id: int = None,
+        use_filament: bool = False,
     ):
         # Create a new model without ceiling bodies
         spec = mujoco.MjSpec.from_file(model_path)
@@ -861,8 +905,8 @@ class iTHORMap(ProcTHORMap):
             cam.orthographic = 1
             h, w = round(px_per_m * aabb_size[0]), round(px_per_m * aabb_size[1])
             px_per_m = h / aabb_size[0]  # recompute to account for rounding
-            renderer = MjOpenGLRenderer(
-                MjModelBindings(model), height=h, width=w, device_id=device_id
+            renderer = _get_renderer(
+                model, width=w, height=h, device_id=device_id, use_filament=use_filament
             )
             renderer.update(data, cam)
             for camera in renderer.scene.camera:
@@ -875,8 +919,8 @@ class iTHORMap(ProcTHORMap):
             assert model.cam_orthographic[cam_model.id], "Camera must be orthographic"
             w, h = model.cam_resolution[cam_model.id]
             px_per_m = h / cam_model.fovy.item()
-            renderer = MjOpenGLRenderer(
-                MjModelBindings(model), height=h, width=w, device_id=device_id
+            renderer = _get_renderer(
+                model, width=w, height=h, device_id=device_id, use_filament=use_filament
             )
             renderer.update(data, camera)
 
@@ -978,7 +1022,7 @@ class iTHORMap(ProcTHORMap):
         return self._px_per_m
 
     @classmethod
-    def load(cls, path: str):
+    def load(cls, path: str, agent_radius: float | None = None):
         if path.endswith(".png"):
             # stacked images
             img = Image.open(path)
@@ -988,6 +1032,14 @@ class iTHORMap(ProcTHORMap):
             map_to_world = np.array(json.loads(img.info["map_to_world"]))
             px_per_m = int(np.ceil(json.loads(img.info["px_per_m"])))
             occupancy = np.array(img) > 0
+
+            if agent_radius is not None:
+                occupancy = ~occupancy
+                rad_px = int(agent_radius * px_per_m)
+                kernel = circular_kernel(rad_px)
+                occupancy = cv2.dilate(occupancy.astype(np.uint8), kernel).astype(bool)
+                occupancy = ~occupancy
+
             return cls(
                 occupancy=occupancy,
                 world_to_map=world_to_map,
@@ -996,8 +1048,15 @@ class iTHORMap(ProcTHORMap):
             )
         elif path.endswith(".npz"):
             data = np.load(path)
+            occupancy = data["occupancy"]
+
+            if agent_radius is not None:
+                rad_px = int(agent_radius * data["px_per_m"])
+                kernel = circular_kernel(rad_px)
+                occupancy = cv2.dilate(occupancy.astype(np.uint8), kernel).astype(bool)
+
             return cls(
-                occupancy=data["occupancy"],
+                occupancy=occupancy,
                 world_to_map=data["world_to_map"],
                 map_to_world=data["map_to_world"],
                 px_per_m=data["px_per_m"],
