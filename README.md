@@ -226,6 +226,7 @@ Add these fields to any experiment config (see `molmo_spaces/configs/abstract_ex
 generate_point_tracks: bool = True
 point_track_num_points: int = 256        # number of points to track
 point_track_sampling: str = "image"      # "vertex" or "image"
+point_track_query_interval: int = 20     # 0 = all from frame 0; N = sample new points every N steps
 ```
 
 | Field | Description |
@@ -233,6 +234,7 @@ point_track_sampling: str = "image"      # "vertex" or "image"
 | `generate_point_tracks` | Enable point track generation |
 | `point_track_num_points` | Number of surface points to sample and track per episode |
 | `point_track_sampling` | `"vertex"` samples actual mesh vertices with equal per-body allocation. `"image"` (recommended) picks visible pixels from the rendered image and unprojects to 3D, Kubric/TAP-Vid style — guarantees initial visibility. |
+| `point_track_query_interval` | `0` (default) samples all points at frame 0. When set to `N > 0` (requires `"image"` mode), 1/4 of points are sampled at frame 0 and new batches are sampled every N steps from newly visible regions. Every point is tracked across all frames; points sampled later have `visibility=0` for earlier frames. |
 
 A ready-made debug config is provided:
 
@@ -270,6 +272,7 @@ data = np.load("episode_00000000_exo_camera_1_point_tracks.npz")
 | `body_ids` | `(N,)` | MuJoCo body ID each point belongs to |
 | `intrinsics` | `(3, 3)` | Camera intrinsic matrix |
 | `num_sampled_from` | scalar | Total mesh vertex count across tracked bodies |
+| `query_frames` | `(N,)` | Frame index at which each point was first sampled (0 when `point_track_query_interval=0`) |
 
 #### Sampling Modes
 
