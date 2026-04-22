@@ -211,8 +211,10 @@ class CPUMujocoEnv(BaseMujocoEnv):
             width, height = (640, 480)  # Default resolution
         if self._use_filament:
             self._renderer = MjFilamentRenderer(model=self.mj_model, width=width, height=height)
+            log.info("Using MuJoCo renderer: filament")
         else:
             self._renderer = MjOpenGLRenderer(model=self.mj_model, width=width, height=height)
+            log.info("Using MuJoCo renderer: classic")
 
         if self._parallelize and self._n_batch > 1:
             self._executor = ThreadPoolExecutor(max_workers=self._n_batch)
@@ -715,21 +717,37 @@ class CPUMujocoEnv(BaseMujocoEnv):
         )
 
         if "ithor" in self.current_model_path:
-            thormap = iTHORMap.from_mj_model_path(
-                model_path=self.current_model_path,
-                agent_radius=agent_radius,
-                px_per_m=px_per_m,
-                device_id=None,
-                use_filament=self.config.use_filament,
-            )
+            model_path = Path(self.current_model_path.replace("_ceiling", ""))
+            precomputed_map = model_path.parent / f"{model_path.stem}_map.png"
+            if precomputed_map.is_file():
+                thormap = iTHORMap.load(
+                    path=precomputed_map.as_posix(),
+                    agent_radius=agent_radius,
+                )
+            else:
+                thormap = iTHORMap.from_mj_model_path(
+                    model_path=self.current_model_path,
+                    agent_radius=agent_radius,
+                    px_per_m=px_per_m,
+                    device_id=None,
+                    use_filament=self.config.use_filament,
+                )
         elif "procthor" in self.current_model_path or "holodeck" in self.current_model_path:
-            thormap = ProcTHORMap.from_mj_model_path(
-                model_path=self.current_model_path,
-                px_per_m=px_per_m,
-                agent_radius=agent_radius,
-                device_id=None,
-                use_filament=self.config.use_filament,
-            )
+            model_path = Path(self.current_model_path.replace("_ceiling", ""))
+            precomputed_map = model_path.parent / f"{model_path.stem}_map.png"
+            if precomputed_map.is_file():
+                thormap = ProcTHORMap.load(
+                    path=precomputed_map.as_posix(),
+                    agent_radius=agent_radius,
+                )
+            else:
+                thormap = ProcTHORMap.from_mj_model_path(
+                    model_path=self.current_model_path,
+                    px_per_m=px_per_m,
+                    agent_radius=agent_radius,
+                    device_id=None,
+                    use_filament=self.config.use_filament,
+                )
         else:
             raise ValueError(f"Unknown scene type: {self.current_model_path}")
 

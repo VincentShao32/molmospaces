@@ -21,17 +21,19 @@ from molmo_spaces.utils.mj_model_and_data_utils import geom_aabb
 
 log = logging.getLogger(__name__)
 
-def _get_renderer(model: MjModel, width: int, height: int, device_id: int, use_filament: bool = False) -> MjOpenGLRenderer | MjFilamentRenderer:
+
+def _get_renderer(
+    model: MjModel, width: int, height: int, device_id: int, use_filament: bool = False
+) -> MjOpenGLRenderer | MjFilamentRenderer:
     renderer: MjOpenGLRenderer | MjFilamentRenderer | None = None
     if use_filament:
-        renderer = MjFilamentRenderer(
-            MjModelBindings(model), height=height, width=width
-        )
+        renderer = MjFilamentRenderer(MjModelBindings(model), height=height, width=width)
     else:
         renderer = MjOpenGLRenderer(
             MjModelBindings(model), height=height, width=width, device_id=device_id
         )
     return renderer
+
 
 def _delete_blacklisted_bodies(spec: mujoco.MjSpec) -> int:
     """Delete bodies from the spec that match blacklisted asset UIDs.
@@ -308,7 +310,7 @@ class ProcTHORMap(THORMap):
         px_per_m: int,
         room_map: np.ndarray = None,
         room_ids_to_name: dict = None,
-        use_filament: bool = False
+        use_filament: bool = False,
     ):
         super().__init__(occupancy_map=occupancy, px_per_m=px_per_m, use_filament=use_filament)
         self.occupancy = occupancy
@@ -391,7 +393,7 @@ class ProcTHORMap(THORMap):
         return self._px_per_m
 
     @classmethod
-    def load(cls, path: str):
+    def load(cls, path: str, agent_radius: float | None = None):
         if path.endswith(".png"):
             # stacked images
             all_img = Image.open(path)
@@ -406,6 +408,15 @@ class ProcTHORMap(THORMap):
             room_ids_to_name = {int(k): v for k, v in room_ids_to_name.items()}
             occupancy = np.array(img) > 0
             room_map = np.array(room_map)
+
+            if agent_radius is not None:
+                occupancy = ~occupancy
+                rad_px = int(agent_radius * px_per_m)
+                kernel = circular_kernel(rad_px)
+                occupancy = cv2.dilate(occupancy.astype(np.uint8), kernel).astype(bool)
+                room_map[occupancy] = 0
+                occupancy = ~occupancy
+
             return cls(
                 occupancy=occupancy,
                 room_map=room_map,
@@ -416,9 +427,25 @@ class ProcTHORMap(THORMap):
             )
         elif path.endswith(".npz"):
             data = np.load(path)
+
+            world_to_map = data["world_to_map"]
+            map_to_world = data["map_to_world"]
+            px_per_m = data["px_per_m"]
+            room_ids_to_name = data["room_ids_to_name"]
+            occupancy = data["occupancy"]
+            room_map = data["occupancy"]
+
+            if agent_radius is not None:
+                occupancy = ~occupancy
+                rad_px = int(agent_radius * px_per_m)
+                kernel = circular_kernel(rad_px)
+                occupancy = cv2.dilate(occupancy.astype(np.uint8), kernel).astype(bool)
+                room_map[occupancy] = 0
+                occupancy = ~occupancy
+
             return cls(
-                occupancy=data["occupancy"],
-                room_map=data["room_map"],
+                occupancy=occupancy,
+                room_map=room_map,
                 room_ids_to_name=data["room_ids_to_name"],
                 world_to_map=data["world_to_map"],
                 map_to_world=data["map_to_world"],
@@ -580,7 +607,9 @@ class ProcTHORMap(THORMap):
             w = round(px_per_m * aabb_size[1])
             effective_px = h / aabb_size[0]
 
-            renderer = _get_renderer(model, width=w, height=h, device_id=device_id, use_filament=use_filament)
+            renderer = _get_renderer(
+                model, width=w, height=h, device_id=device_id, use_filament=use_filament
+            )
             renderer.update(data, cam)
             for camera in renderer.scene.camera:
                 camera: mujoco.MjvGLCamera
@@ -876,7 +905,9 @@ class iTHORMap(ProcTHORMap):
             cam.orthographic = 1
             h, w = round(px_per_m * aabb_size[0]), round(px_per_m * aabb_size[1])
             px_per_m = h / aabb_size[0]  # recompute to account for rounding
-            renderer = _get_renderer(model, width=w, height=h, device_id=device_id, use_filament=use_filament)
+            renderer = _get_renderer(
+                model, width=w, height=h, device_id=device_id, use_filament=use_filament
+            )
             renderer.update(data, cam)
             for camera in renderer.scene.camera:
                 camera: mujoco.MjvGLCamera
@@ -888,7 +919,9 @@ class iTHORMap(ProcTHORMap):
             assert model.cam_orthographic[cam_model.id], "Camera must be orthographic"
             w, h = model.cam_resolution[cam_model.id]
             px_per_m = h / cam_model.fovy.item()
-            renderer = _get_renderer(model, width=w, height=h, device_id=device_id, use_filament=use_filament)
+            renderer = _get_renderer(
+                model, width=w, height=h, device_id=device_id, use_filament=use_filament
+            )
             renderer.update(data, camera)
 
         cam_to_world = np.eye(4)
@@ -989,7 +1022,7 @@ class iTHORMap(ProcTHORMap):
         return self._px_per_m
 
     @classmethod
-    def load(cls, path: str):
+    def load(cls, path: str, agent_radius: float | None = None):
         if path.endswith(".png"):
             # stacked images
             img = Image.open(path)
@@ -999,6 +1032,14 @@ class iTHORMap(ProcTHORMap):
             map_to_world = np.array(json.loads(img.info["map_to_world"]))
             px_per_m = int(np.ceil(json.loads(img.info["px_per_m"])))
             occupancy = np.array(img) > 0
+
+            if agent_radius is not None:
+                occupancy = ~occupancy
+                rad_px = int(agent_radius * px_per_m)
+                kernel = circular_kernel(rad_px)
+                occupancy = cv2.dilate(occupancy.astype(np.uint8), kernel).astype(bool)
+                occupancy = ~occupancy
+
             return cls(
                 occupancy=occupancy,
                 world_to_map=world_to_map,
@@ -1007,8 +1048,15 @@ class iTHORMap(ProcTHORMap):
             )
         elif path.endswith(".npz"):
             data = np.load(path)
+            occupancy = data["occupancy"]
+
+            if agent_radius is not None:
+                rad_px = int(agent_radius * data["px_per_m"])
+                kernel = circular_kernel(rad_px)
+                occupancy = cv2.dilate(occupancy.astype(np.uint8), kernel).astype(bool)
+
             return cls(
-                occupancy=data["occupancy"],
+                occupancy=occupancy,
                 world_to_map=data["world_to_map"],
                 map_to_world=data["map_to_world"],
                 px_per_m=data["px_per_m"],
