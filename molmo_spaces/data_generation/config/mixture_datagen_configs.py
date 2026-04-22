@@ -82,7 +82,7 @@ def _franka_pick_and_place_point_track() -> MixtureSpec:
                 config_name="FrankaPickPointTrackDebug",
                 num_houses=10,
                 samples_per_house=10,
-                point_track_num_points=5000,
+                point_track_num_points=32768,
                 point_track_include_background=True,
                 point_track_background_fraction=0.3
             ),
@@ -97,11 +97,11 @@ def _rby1_pick_point_track() -> MixtureSpec:
         components=(
             MixtureComponent(
                 config_name="RBY1PickPointTrack",
-                num_houses=2000,
+                num_houses=3000,
                 samples_per_house=10,
-                point_track_num_points=5000,
+                point_track_num_points=32768,
                 point_track_include_background=True,
-                point_track_background_fraction=0.3
+                point_track_background_fraction=0.4
             ),
         ),
     )
@@ -114,9 +114,9 @@ def _rum_pick_point_track() -> MixtureSpec:
         components=(
             MixtureComponent(
                 config_name="RUMPickPointTrack",
-                num_houses=10,
+                num_houses=3000,
                 samples_per_house=10,
-                point_track_num_points=5000,
+                point_track_num_points=32768,
             ),
         ),
     )

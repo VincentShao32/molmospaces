@@ -92,7 +92,7 @@ class FrankaPickPointTrackDebug(PickBaseConfig):
         house_inds=random.sample(range(99925), k=3000),
         samples_per_house=10,
     )
-    num_workers: int = 8
+    num_workers: int = 1
     use_wandb: bool = False
     filter_for_successful_trajectories: bool = False
     generate_point_tracks: bool = True
