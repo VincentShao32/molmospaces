@@ -32,21 +32,27 @@ def _point_track_trio() -> MixtureSpec:
         components=(
             MixtureComponent(
                 config_name="FrankaPickPointTrackDebug",
-                num_houses=2,
-                samples_per_house=3,
-                point_track_num_points=100,
+                num_houses=3000,
+                samples_per_house=10,
+                point_track_num_points=32000,
+                point_track_include_background=True,
+                point_track_background_fraction=0.4
             ),
             MixtureComponent(
                 config_name="FrankaPickAndPlacePointTrack",
-                num_houses=2,
-                samples_per_house=3,
-                point_track_num_points=100,
+                num_houses=3000,
+                samples_per_house=10,
+                point_track_num_points=32000,
+                point_track_include_background=True,
+                point_track_background_fraction=0.4
             ),
             MixtureComponent(
                 config_name="RBY1PickPointTrack",
-                num_houses=15,
-                samples_per_house=5,
-                point_track_num_points=100,
+                num_houses=3000,
+                samples_per_house=10,
+                point_track_num_points=32000,
+                point_track_include_background=True,
+                point_track_background_fraction=0.4
             ),
         ),
     )
@@ -58,9 +64,27 @@ def _franka_pick_and_place_point_track() -> MixtureSpec:
         components=(
             MixtureComponent(
                 config_name="FrankaPickAndPlacePointTrack",
-                num_houses=3000,
+                num_houses=10,
                 samples_per_house=10,
                 point_track_num_points=5000,
+                point_track_include_background=True,
+                point_track_background_fraction=0.3
+            ),
+        ),
+    )
+
+@register_mixture("FrankaPickPointTrackOnly")
+def _franka_pick_and_place_point_track() -> MixtureSpec:
+    """Single-component mixture: just FrankaPickPointTrack at full scale."""
+    return MixtureSpec(
+        components=(
+            MixtureComponent(
+                config_name="FrankaPickPointTrackDebug",
+                num_houses=10,
+                samples_per_house=10,
+                point_track_num_points=5000,
+                point_track_include_background=True,
+                point_track_background_fraction=0.3
             ),
         ),
     )

@@ -113,6 +113,9 @@ class MlSpacesExpConfig(Config, ABC):
     # static the trajectories collapse to camera-motion-only signal.
     point_track_include_background: bool = False
     point_track_background_fraction: float = 0.25
+    # Image sampling only: subsample candidate pixels on a square stride grid
+    # with random phase (Kubric-style). 1 = dense (legacy) sampling.
+    point_track_image_stride: int = 1
 
     def model_post_init(self, _context) -> None:
         """This serves as the __init__() called after internal validation of config parameters"""

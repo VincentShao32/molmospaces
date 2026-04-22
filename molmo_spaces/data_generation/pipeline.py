@@ -793,6 +793,11 @@ class ParallelRolloutRunner:
         )
         pt_sampling = getattr(exp_config, "point_track_sampling", "vertex") if exp_config else "vertex"
         pt_query_interval = getattr(exp_config, "point_track_query_interval", 0) if exp_config else 0
+        pt_image_stride = (
+            max(1, int(getattr(exp_config, "point_track_image_stride", 1)))
+            if exp_config
+            else 1
+        )
         pt_local_coords = None
         pt_body_ids = None
         pt_initial_world = None
@@ -868,6 +873,7 @@ class ParallelRolloutRunner:
                                 object_body_ids=obj_bids,
                                 background_body_ids=pt_bg_bids,
                                 background_fraction=pt_bg_fraction,
+                                image_stride=pt_image_stride,
                             )
                             cam_entry["local_coords"] = lc
                             cam_entry["body_ids"] = bi
@@ -911,6 +917,7 @@ class ParallelRolloutRunner:
                         object_body_ids=obj_bids,
                         background_body_ids=pt_bg_bids,
                         background_fraction=pt_bg_fraction,
+                        image_stride=pt_image_stride,
                     )
                     if len(cand_lc) > 0:
                         cam_data["_candidates_lc"].append(cand_lc)
@@ -1008,6 +1015,7 @@ class ParallelRolloutRunner:
                                 object_body_ids=obj_bids,
                                 background_body_ids=pt_bg_bids,
                                 background_fraction=pt_bg_fraction,
+                                image_stride=pt_image_stride,
                             )
                             if len(cand_lc) > 0:
                                 cam_data["_candidates_lc"].append(cand_lc)

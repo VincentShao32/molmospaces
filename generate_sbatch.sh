@@ -8,7 +8,7 @@
 cd /gpfs/scrubbed/yunbos/video_datasets/molmospaces/molmospaces
 MUJOCO_GL=egl PYOPENGL_PLATFORM=egl MUJOCO_INSTALL_DIR=/gpfs/scrubbed/yunbos/video_datasets/molmospaces/assets/ \
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-/gpfs/home/yunbos/.conda/envs/mlspaces/bin/python -m molmo_spaces.data_generation.mixture_main RBY1PickPointTrackOnly
+/gpfs/home/yunbos/.conda/envs/mlspaces/bin/python -m molmo_spaces.data_generation.mixture_main PointTrackTrioMixture
 # Override per-component house counts as needed, e.g.:
 #   ... mixture_main PointTrackTrioMixture \
 #       --override FrankaPickPointTrackDebug=2000 \

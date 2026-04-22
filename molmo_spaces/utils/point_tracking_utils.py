@@ -155,6 +155,30 @@ def get_trackable_body_ids(model: MjModel) -> set[int]:
     return get_object_body_ids(model) | get_robot_body_ids(model)
 
 
+def _random_phase_strided_mask(
+    height: int, width: int, stride: int, rng: np.random.RandomState
+) -> np.ndarray | None:
+    """Boolean (H, W) mask: True on pixels aligned to a stride grid with random origin.
+
+    Matches the Kubric-style idea: only pixels whose indices satisfy
+    ``(y - oy) % stride == 0`` and ``(x - ox) % stride == 0`` for random
+    ``oy, ox`` in ``[0, stride)``. Returns ``None`` when ``stride <= 1`` (no mask).
+    """
+    if stride <= 1:
+        return None
+    oy = int(rng.randint(0, stride))
+    ox = int(rng.randint(0, stride))
+    yy = np.arange(height, dtype=np.int32)[:, None]
+    xx = np.arange(width, dtype=np.int32)[None, :]
+    return ((yy - oy) % stride == 0) & ((xx - ox) % stride == 0)
+
+
+def _apply_strided_mask(mask: np.ndarray, grid: np.ndarray | None) -> np.ndarray:
+    if grid is None:
+        return mask
+    return mask & grid
+
+
 def sample_from_image(
     model: MjModel,
     data: MjData,
@@ -169,6 +193,7 @@ def sample_from_image(
     prefer_body_ids: set[int] | None = None,
     background_body_ids: set[int] | None = None,
     background_fraction: float = 0.0,
+    image_stride: int = 1,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
     """Sample tracked points by picking visible pixels on objects.
 
@@ -176,6 +201,10 @@ def sample_from_image(
     use segmentation to find which body they belong to, unproject to 3D, and
     convert to body-local coordinates for tracking. Every sampled point is
     guaranteed visible in this frame.
+
+    When ``image_stride > 1``, candidates are restricted to a strided 2D grid
+    with a random sub-pixel phase (same spirit as Kubric's ``sampling_stride``),
+    then the usual uniform subsampling runs on that subset.
 
     Args:
         model: MjModel for mesh geometry lookup
@@ -205,6 +234,8 @@ def sample_from_image(
             ``background_body_ids`` is not ``None``. If the requested
             background quota can't be filled (e.g. no background visible),
             the leftover is returned to the foreground budget.
+        image_stride: If > 1, only pixels on a ``stride`` grid (random origin)
+            are eligible. ``1`` keeps the original dense-pixel behavior.
 
     Returns:
         local_coords: (N, 3) body-local coords for tracking
@@ -215,6 +246,9 @@ def sample_from_image(
     rng = np.random.RandomState(seed)
 
     body_id_map = seg_frame[:, :, 2]  # (H, W) body id per pixel
+    h, w = body_id_map.shape
+    stride = max(1, int(image_stride))
+    grid_mask = _random_phase_strided_mask(h, w, stride, rng)
 
     want_background_split = (
         background_body_ids is not None and background_fraction > 0.0
@@ -243,6 +277,9 @@ def sample_from_image(
             fg_mask = np.isin(body_id_map, list(object_body_ids)) & ~bg_mask
         else:
             fg_mask = (body_id_map > 0) & ~bg_mask
+
+        bg_mask = _apply_strided_mask(bg_mask, grid_mask)
+        fg_mask = _apply_strided_mask(fg_mask, grid_mask)
 
         # Budget split: background gets its requested share, foreground gets
         # the rest (including any leftover when background can't be filled).
@@ -316,6 +353,8 @@ def sample_from_image(
         valid_mask = np.isin(body_id_map, list(object_body_ids))
     else:
         valid_mask = body_id_map > 0
+
+    valid_mask = _apply_strided_mask(valid_mask, grid_mask)
 
     if prefer_body_ids is not None and len(prefer_body_ids) > 0:
         prefer_mask = valid_mask & np.isin(body_id_map, list(prefer_body_ids))

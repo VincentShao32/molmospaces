@@ -23,10 +23,20 @@ disk. Anything missing => clear the flag, remove stale partial files, and
 re-invoke ``manager.install_packages`` to re-fetch + re-extract the affected
 archives.
 
+Robot assets under ``<MLSPACES_ASSETS_DIR>/robots/<name>/`` are typically
+symlinks into ``generated_cache``. A partial robot extract leaves
+``_*_complete_extract`` flags while some ``*.obj`` targets are missing, which
+makes MuJoCo fail at compile time with "No such file or directory". The
+startup hook therefore also walks those trees for **dangling symlinks** and
+re-installs the affected robot archives (same spirit as archive repair).
+
 Public entry points:
 
 * :func:`verify_resource_cache` -- library function. Returns a per
   ``(data_type, source)`` summary.
+* :func:`find_robots_with_dangling_symlinks` -- detect broken
+  ``<ASSETS_DIR>/robots/<name>/`` symlink trees (partial robot extracts).
+* :func:`repair_robot_installs` -- clear extract flags and re-install named robots.
 * :func:`verify_and_repair_at_startup` -- convenience wrapper used by the
   data-generation entry points. Honours ``MLSPACES_SKIP_CACHE_VERIFY=1`` to
   short-circuit, and only complains -- never crashes -- if anything goes
@@ -292,8 +302,71 @@ def _truthy_env(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).lower() in {"1", "true", "yes"}
 
 
+def find_robots_with_dangling_symlinks(robots_symlink_root: Path) -> list[str]:
+    """Return sorted robot names under ``robots_symlink_root`` that have a broken symlink.
+
+    A symlink is broken when ``Path.is_symlink()`` is true and ``Path.exists()``
+    is false (missing target in the content cache).
+    """
+    if not robots_symlink_root.is_dir():
+        return []
+    broken: list[str] = []
+    for robot_dir in sorted(robots_symlink_root.iterdir()):
+        if not robot_dir.is_dir():
+            continue
+        has_dangling = False
+        try:
+            for p in robot_dir.rglob("*"):
+                try:
+                    if p.is_symlink() and not p.exists():
+                        has_dangling = True
+                        logger.debug("Dangling symlink: %s -> %s", p, p.readlink())
+                        break
+                except OSError as e:
+                    logger.debug("Symlink check failed for %s: %s", p, e)
+                    has_dangling = True
+                    break
+        except OSError as e:
+            logger.warning("Could not walk robot dir %s: %s", robot_dir, e)
+            continue
+        if has_dangling:
+            broken.append(robot_dir.name)
+    return broken
+
+
+def repair_robot_installs(manager: "ResourceManager", robot_names: list[str]) -> None:
+    """Clear extract-complete flags and re-install listed robots (refreshes symlinks)."""
+    for name in robot_names:
+        try:
+            cache_dest = manager.cache_path("robots", name)
+        except Exception as e:
+            logger.warning("cache_path(robots, %s) failed: %s", name, e)
+            continue
+        if cache_dest.is_dir():
+            for flag in cache_dest.glob(".*_complete_extract"):
+                _force_unlink(flag)
+        try:
+            pkgs = manager.find_all_packages_for_source("robots", name)
+        except Exception as e:
+            logger.warning("find_all_packages_for_source(robots, %s) failed: %s", name, e)
+            continue
+        if not pkgs:
+            logger.warning(
+                "No robot archive packages found for %r; remove %s manually or set "
+                "MLSPACES_FORCE_INSTALL when fetching.",
+                name,
+                cache_dest,
+            )
+            continue
+        try:
+            manager.install_packages("robots", {name: pkgs}, skip_linking=False)
+            logger.info("Re-installed robot %r (%d package(s))", name, len(pkgs))
+        except Exception as e:
+            logger.warning("install_packages failed for robot %r: %s", name, e)
+
+
 def verify_and_repair_at_startup(
-    data_types: Iterable[str] | None = ("objects", "scenes", "grasps"),
+    data_types: Iterable[str] | None = ("objects", "scenes", "grasps", "robots"),
 ) -> list[SourceVerifyReport]:
     """Best-effort startup hook used by the data-generation entry points.
 
@@ -303,12 +376,13 @@ def verify_and_repair_at_startup(
     * Otherwise scans the requested data types using
       :func:`verify_resource_cache` in dry-run mode (cheap; just ``Path.exists``
       lookups against each archive's manifest trie).
-    * If 0 broken archives -> prints a clean bill of health and returns.
-    * If >=1 broken archives -> **always** auto-repairs in place, regardless
-      of how many. Repair cost (re-download + re-extract) scales with the
-      broken count, so a very corrupted cache will delay job startup, but
-      that's strictly preferable to workers dying on missing files once
-      rollouts begin.
+    * Independently scans ``<ASSETS_DIR>/robots/*/`` for **dangling symlinks**
+      (partial robot extracts). Those are repaired even when archive tries are
+      absent or report a clean bill of health.
+    * If 0 broken archives **and** 0 broken robot symlinks -> prints healthy and returns.
+    * If >=1 broken archives -> **always** auto-repairs those in place.
+    * If >=1 broken robot symlink trees -> clears the robot's extract flags and
+      re-runs ``install_packages`` for that robot (may re-download).
 
     Never raises: any verification failure is logged but the pipeline still
     proceeds (worst case: the job hits the same per-house failure it would
@@ -332,28 +406,66 @@ def verify_and_repair_at_startup(
         print(f"[CACHE-VERIFY] WARNING: scan crashed: {e!r}", flush=True)
         return []
 
-    total_broken = sum(len(r.broken_archives) for r in scan_reports)
+    archive_broken = sum(len(r.broken_archives) for r in scan_reports)
 
-    if total_broken == 0:
-        print("[CACHE-VERIFY] all extracts look healthy.", flush=True)
-        return scan_reports
-
-    print(
-        f"[CACHE-VERIFY] found {total_broken} broken archive(s); "
-        "auto-repairing (this may take a while)...",
-        flush=True,
-    )
+    robot_broken: list[str] = []
     try:
-        reports = verify_resource_cache(data_types=data_types, dry_run=False)
+        from molmo_spaces.molmo_spaces_constants import ASSETS_DIR
+
+        robot_broken = find_robots_with_dangling_symlinks(ASSETS_DIR / "robots")
     except Exception as e:  # pragma: no cover - defensive
-        print(f"[CACHE-VERIFY] WARNING: repair crashed: {e!r}", flush=True)
+        print(f"[CACHE-VERIFY] WARNING: robot symlink scan crashed: {e!r}", flush=True)
+
+    if archive_broken == 0 and not robot_broken:
+        print(
+            "[CACHE-VERIFY] all extracts and robot symlinks look healthy.",
+            flush=True,
+        )
         return scan_reports
 
-    total_repaired = sum(len(r.repaired_archives) for r in reports)
-    total_still_broken = sum(len(r.still_broken_archives) for r in reports)
-    print(
-        f"[CACHE-VERIFY] repaired {total_repaired}, still broken {total_still_broken}.",
-        flush=True,
-    )
-    print(format_reports(reports), flush=True)
+    reports: list[SourceVerifyReport] = list(scan_reports)
+
+    if archive_broken:
+        print(
+            f"[CACHE-VERIFY] found {archive_broken} broken archive(s); "
+            "auto-repairing (this may take a while)...",
+            flush=True,
+        )
+        try:
+            reports = verify_resource_cache(data_types=data_types, dry_run=False)
+        except Exception as e:  # pragma: no cover - defensive
+            print(f"[CACHE-VERIFY] WARNING: archive repair crashed: {e!r}", flush=True)
+
+        total_repaired = sum(len(r.repaired_archives) for r in reports)
+        total_still_broken = sum(len(r.still_broken_archives) for r in reports)
+        print(
+            f"[CACHE-VERIFY] archives: repaired {total_repaired}, "
+            f"still broken {total_still_broken}.",
+            flush=True,
+        )
+        print(format_reports(reports), flush=True)
+
+    if robot_broken:
+        print(
+            f"[CACHE-VERIFY] dangling symlinks under robots/: {robot_broken}; "
+            "re-installing those robot package(s)...",
+            flush=True,
+        )
+        try:
+            from molmo_spaces.molmo_spaces_constants import ASSETS_DIR, get_resource_manager
+
+            mgr = get_resource_manager()
+            repair_robot_installs(mgr, robot_broken)
+            still = find_robots_with_dangling_symlinks(ASSETS_DIR / "robots")
+            if still:
+                print(
+                    f"[CACHE-VERIFY] WARNING: robots still have dangling symlinks "
+                    f"after repair: {still}",
+                    flush=True,
+                )
+            else:
+                print("[CACHE-VERIFY] robot symlink repair complete.", flush=True)
+        except Exception as e:  # pragma: no cover - defensive
+            print(f"[CACHE-VERIFY] WARNING: robot repair crashed: {e!r}", flush=True)
+
     return reports

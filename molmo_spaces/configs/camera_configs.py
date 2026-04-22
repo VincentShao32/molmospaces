@@ -537,8 +537,8 @@ class FrankaOmniPurposeCameraSystem(CameraSystemConfig):
         # Two randomized exocentric cameras positioned around workspace center
         RandomizedExocentricCameraConfig(
             name="randomized_zed2_analogue_1",
-            distance_range=(0.6, 1.2),
-            height_range=(0.15, 0.7),
+            distance_range=(0.2, 0.8),
+            height_range=(0.05, 0.6),
             azimuth_range=(0, 2 * np.pi),
             fov_range=(64, 72),
             lookat_noise_range=(-0.1, 0.1),
@@ -551,8 +551,8 @@ class FrankaOmniPurposeCameraSystem(CameraSystemConfig):
         ),
         RandomizedExocentricCameraConfig(
             name="randomized_zed2_analogue_2",
-            distance_range=(0.6, 1.2),
-            height_range=(0.15, 0.7),
+            distance_range=(0.2, 0.8),
+            height_range=(0.05, 0.6),
             azimuth_range=(0, 2 * np.pi),
             fov_range=(64, 72),
             lookat_noise_range=(-0.1, 0.1),
@@ -565,8 +565,8 @@ class FrankaOmniPurposeCameraSystem(CameraSystemConfig):
         ),
         RandomizedExocentricCameraConfig(
             name="randomized_gopro_analogue_1",
-            distance_range=(0.45, 0.8),
-            height_range=(0.2, 0.7),
+            distance_range=(0.2, 0.5),
+            height_range=(0.1, 0.6),
             azimuth_range=(0, 2 * np.pi),
             fov_range=(137, 140),  # GoPro vertical FOV
             is_warped=False,  # NOTE: baked in warping not yet implemented
