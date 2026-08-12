@@ -216,51 +216,146 @@ python molmo_spaces/data_generation/main.py FrankaPickOmniCamConfig
 
 ### Point Track Generation
 
-The data generation pipeline can produce per-video point tracking data alongside RGB videos. Point tracks consist of 2D trajectories, 3D positions, and per-frame visibility (occlusion) labels for a set of sampled surface points, saved as `.npz` files.
+The data generation pipeline can save point tracks alongside each generated RGB
+video. A track contains a point's 2D trajectory, 3D world position, and
+per-frame visibility. Point tracks are generated as part of the normal task
+rollout; the separate video and track files therefore have matching frames.
+
+The recommended entry point is the mixture runner:
+
+```bash
+python -m molmo_spaces.data_generation.mixture_main <mixture-name>
+```
+
+It works in a local shell, container, interactive GPU allocation, or batch job.
+The commands below deliberately do not assume a particular scheduler or
+filesystem layout.
+
+#### Prerequisites
+
+Install MolmoSpaces in the active Python environment and prepare its assets as
+described in [the asset documentation](docs/assets.md). Then point the process
+at the cache and asset trees:
+
+```bash
+export MLSPACES_CACHE_DIR=/path/to/molmospaces-cache
+export MLSPACES_ASSETS_DIR=/path/to/molmospaces-assets
+```
+
+On a headless Linux machine with GPU rendering, also use EGL:
+
+```bash
+export MUJOCO_GL=egl
+export PYOPENGL_PLATFORM=egl
+```
+
+Run generation from the repository root and from within a GPU allocation when
+using a shared compute system. `MLSPACES_SKIP_CACHE_VERIFY=1` can skip the
+startup cache-integrity scan when the cache is already known to be complete;
+leave it unset when a potentially partial cache should be checked and repaired.
+
+#### Ready-made mixtures
+
+List the mixtures registered by the installed checkout with:
+
+```bash
+python -m molmo_spaces.data_generation.mixture_main --list
+```
+
+The point-track mixtures currently include:
+
+| Mixture | Component name used by overrides | Content |
+|---|---|---|
+| `FrankaPickPointTrackOnly` | `FrankaPickPointTrackDebug` | Franka pick with wrist, shoulder, and randomized external cameras |
+| `FrankaPickPointTrackAnimatedCamOnly` | `FrankaPickPointTrackAnimatedCam` | Franka pick with animated camera motion |
+| `FrankaPickPointTrackWristOnly` | `FrankaPickPointTrackWristOnly` | Franka pick from the wrist camera only |
+| `FrankaPickAndPlacePointTrackOnly` | `FrankaPickAndPlacePointTrack` | Franka pick-and-place |
+| `RBY1PickPointTrackOnly` | `RBY1PickPointTrack` | RBY1 pick |
+| `RUMPickPointTrackOnly` | `RUMPickPointTrack` | Floating-gripper pick |
+| `PointTrackTrioMixture` | Three component names | Franka pick, Franka pick-and-place, and RBY1 pick in sequence |
+
+The override flags take a **component config name**, not the mixture name.
+
+#### Small example
+
+Start with a small run before scaling up. This example samples 10 houses, one
+episode per house, and 5,000 points for every generated camera video:
+
+```bash
+python -m molmo_spaces.data_generation.mixture_main \
+    FrankaPickPointTrackOnly \
+    --override FrankaPickPointTrackDebug=10 \
+    --samples-override FrankaPickPointTrackDebug=1 \
+    --points-override FrankaPickPointTrackDebug=5000 \
+    --include-background FrankaPickPointTrackDebug=true \
+    --bg-fraction FrankaPickPointTrackDebug=0.2
+```
+
+Available scale and sampling overrides are:
+
+| Flag | Meaning |
+|---|---|
+| `--override CONFIG=N` | Sample `N` unique house indices for that component |
+| `--samples-override CONFIG=N` | Request `N` episodes per sampled house |
+| `--points-override CONFIG=N` | Track `N` points in each camera video |
+| `--include-background CONFIG=BOOL` | Reserve some tracks for static scene geometry |
+| `--bg-fraction CONFIG=F` | Set the background fraction to `F` in `[0, 1]` |
+
+Flags are repeatable for multi-component mixtures. Each invocation samples its
+houses independently and creates a new timestamped output directory.
 
 #### Enabling Point Tracks in a Config
 
-Add these fields to any experiment config (see `molmo_spaces/configs/abstract_exp_config.py`):
+To build another point-track configuration, add or override these fields on an
+experiment config (see `molmo_spaces/configs/abstract_exp_config.py`):
 
 ```python
 generate_point_tracks: bool = True
-point_track_num_points: int = 256        # number of points to track
-point_track_sampling: str = "image"      # "vertex" or "image"
-point_track_query_interval: int = 20     # 0 = all from frame 0; N = sample new points every N steps
+point_track_num_points: int = 5000
+point_track_sampling: str = "image"
+point_track_query_interval: int = 20
+point_tracks_only: bool = True
+point_track_include_background: bool = True
+point_track_background_fraction: float = 0.2
 ```
 
 | Field | Description |
 |---|---|
 | `generate_point_tracks` | Enable point track generation |
-| `point_track_num_points` | Number of surface points to sample and track per episode |
+| `point_track_num_points` | Number of points to track per camera video |
 | `point_track_sampling` | `"vertex"` samples actual mesh vertices with equal per-body allocation. `"image"` (recommended) picks visible pixels from the rendered image and unprojects to 3D, Kubric/TAP-Vid style — guarantees initial visibility. |
 | `point_track_query_interval` | `0` (default) samples all points at frame 0. When set to `N > 0` (requires `"image"` mode), 1/4 of points are sampled at frame 0 and new batches are sampled every N steps from newly visible regions. Every point is tracked across all frames; points sampled later have `visibility=0` for earlier frames. |
+| `point_tracks_only` | Save RGB videos and point tracks without producing the normal HDF5 observation bundle |
+| `point_track_include_background` | Include points on static scene geometry as well as task/robot bodies |
+| `point_track_background_fraction` | Fraction of the point budget reserved for background geometry |
 
-A ready-made debug config is provided:
+#### Output layout and format
 
-```python
-@register_config("FrankaPickPointTrackDebug")
-class FrankaPickPointTrackDebug(PickBaseConfig):
-    generate_point_tracks: bool = True
-    point_track_num_points: int = 256
-    point_track_sampling: str = "vertex"
-    ...
+Mixture outputs are written below `MLSPACES_ASSETS_DIR`:
+
+```text
+$MLSPACES_ASSETS_DIR/experiment_output/datagen/mixtures/
+  <mixture-name>/<timestamp>/
+    mixture_spec.json
+    <component-config>/house_<house-id>/
+      episode_00000000_<camera>_batch_1_of_1.mp4
+      episode_00000000_<camera>_point_tracks.npz
+    mixture_summary.json
 ```
 
-#### Running
+`mixture_spec.json` records the requested run before workers start.
+`mixture_summary.json` is written after a normal completion. Invalid scenes or
+tasks can be skipped, so inspect the summary rather than assuming every
+requested house produced an episode.
 
-```bash
-cd molmospaces
-MUJOCO_GL=egl PYOPENGL_PLATFORM=egl python -m molmo_spaces.data_generation.main FrankaPickPointTrackDebug
-```
-
-#### Output Format
-
-For each episode and camera, a file `episode_XXXXXXXX_<camera>_point_tracks.npz` is saved alongside the video. Load it with:
+Load a track file with NumPy:
 
 ```python
 import numpy as np
-data = np.load("episode_00000000_exo_camera_1_point_tracks.npz")
+
+with np.load("episode_00000000_exo_camera_1_point_tracks.npz") as data:
+    print(data["trajs_2d"].shape)   # (frames, points, 2)
+    print(data["visibility"].shape) # (frames, points)
 ```
 
 | Key | Shape | Description |
@@ -268,15 +363,41 @@ data = np.load("episode_00000000_exo_camera_1_point_tracks.npz")
 | `trajs_2d` | `(T, N, 2)` | 2D pixel coordinates per frame |
 | `visibility` | `(T, N)` | `1.0` = visible, `0.0` = occluded or out of frame |
 | `points_3d` | `(T, N, 3)` | 3D world positions per frame |
-| `points_3d_initial` | `(N, 3)` | 3D world positions at the sampling frame |
 | `body_ids` | `(N,)` | MuJoCo body ID each point belongs to |
 | `intrinsics` | `(3, 3)` | Camera intrinsic matrix |
-| `num_sampled_from` | scalar | Total mesh vertex count across tracked bodies |
-| `query_frames` | `(N,)` | Frame index at which each point was first sampled (0 when `point_track_query_interval=0`) |
+| `query_frames` | `(N,)` | Frame at which each point was introduced |
+| `points_3d_initial` | `(N, 3)` | Optional initial 3D positions |
+| `num_sampled_from` | scalar | Optional mesh-vertex population size |
 
-#### Sampling Modes
+For a quick integrity check, verify that the point count is correct, arrays are
+finite, and visible coordinates lie inside the video frame:
 
-- **`"vertex"`**: Samples actual mesh vertices from all non-world bodies, distributing the point budget equally across bodies. Fast and deterministic but some points may start occluded.
+```python
+import numpy as np
+
+with np.load("episode_00000000_exo_camera_1_point_tracks.npz") as data:
+    xy = data["trajs_2d"]
+    visible = data["visibility"].astype(bool)
+    frame_height, frame_width = 576, 1024  # read from the paired video
+    assert xy.shape[1] == 5000
+    assert np.isfinite(xy).all()
+    assert np.isfinite(data["points_3d"]).all()
+    assert ((0 <= xy[..., 0][visible]) &
+            (xy[..., 0][visible] < frame_width)).all()
+    assert ((0 <= xy[..., 1][visible]) &
+            (xy[..., 1][visible] < frame_height)).all()
+```
+
+#### Scaling and resource use
+
+Point-track generation renders every configured camera and retains per-frame
+track data until the episode is saved. Memory use therefore grows with the
+number of worker processes, cameras, frames, and points. Begin with a small
+house count, monitor host memory as well as GPU utilization, and scale
+gradually. If a run exhausts host memory, reduce the config's `num_workers` or
+split the work into smaller invocations. Output data can remain on a large
+scratch/data filesystem even when the repository and Python environment live
+elsewhere.
 
 
 ## Teleop Input
