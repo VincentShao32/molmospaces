@@ -46,6 +46,11 @@ class MixtureComponent:
             ``point_track_background_fraction`` field (``[0, 1]``). Ignored
             unless background sampling is enabled. ``None`` keeps the
             sub-config default.
+        scene_dataset: Optional override for the sub-config's ``scene_dataset``
+            string (e.g. ``"procthor-10k"``). ``None`` keeps the sub-config
+            default.
+        data_split: Optional override for the sub-config's ``data_split`` string
+            (e.g. ``"train"``). ``None`` keeps the sub-config default.
     """
 
     config_name: str
@@ -54,6 +59,8 @@ class MixtureComponent:
     point_track_num_points: int | None = None
     point_track_include_background: bool | None = None
     point_track_background_fraction: float | None = None
+    scene_dataset: str | None = None
+    data_split: str | None = None
 
 
 @dataclass(frozen=True)
@@ -61,7 +68,7 @@ class MixtureSpec:
     """A named mixture of datagen sub-configs."""
 
     components: tuple[MixtureComponent, ...]
-    max_house_index: int = 99925  # Upper bound for sampling random house indices
+    max_house_index: int = 9000  # Upper bound for sampling random house indices
 
     def __post_init__(self) -> None:
         # Catch the classic single-element-tuple bug ("components=(x)" instead

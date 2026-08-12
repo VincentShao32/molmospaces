@@ -215,6 +215,8 @@ def apply_overrides(
             point_track_background_fraction=bg_fraction_map.get(
                 c.config_name, c.point_track_background_fraction
             ),
+            scene_dataset=c.scene_dataset,
+            data_split=c.data_split,
         )
         for c in spec.components
     )
@@ -229,6 +231,22 @@ def _instantiate_component(
     """Build the sub-config instance for one component, applying overrides."""
     cfg_cls = get_config_class(component.config_name)
     exp_config = cfg_cls()
+
+    if component.scene_dataset is not None:
+        if not hasattr(exp_config, "scene_dataset"):
+            raise ValueError(
+                f"Component {component.config_name!r} doesn't expose `scene_dataset`; "
+                "remove the mixture override or pick a compatible sub-config."
+            )
+        exp_config.scene_dataset = component.scene_dataset
+
+    if component.data_split is not None:
+        if not hasattr(exp_config, "data_split"):
+            raise ValueError(
+                f"Component {component.config_name!r} doesn't expose `data_split`; "
+                "remove the mixture override or pick a compatible sub-config."
+            )
+        exp_config.data_split = component.data_split
 
     if not hasattr(exp_config, "task_sampler_config") or not hasattr(
         exp_config.task_sampler_config, "house_inds"

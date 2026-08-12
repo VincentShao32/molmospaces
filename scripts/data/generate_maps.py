@@ -6,6 +6,7 @@ import tyro
 from p_tqdm import p_uimap
 from tqdm import tqdm
 
+from molmo_spaces.utils.lazy_loading_utils import install_scene_with_objects_and_grasps_from_path
 from molmo_spaces.utils.scene_maps import ProcTHORMap, iTHORMap
 
 SKIP_SUBSTR = ("orig", "fix", "non_settled", "ceiling")
@@ -27,6 +28,12 @@ class Args:
 def generate_map(scene_xml: Path) -> bool:
     success = False
     try:
+        # Scene XMLs reference objaverse objects by relative path. The shared
+        # cache is often missing archives, so ensure every referenced object is
+        # extracted before handing the XML to mujoco. iTHOR scenes (FloorPlan*)
+        # do not carry objaverse deps but running this is cheap and harmless.
+        install_scene_with_objects_and_grasps_from_path(scene_xml.as_posix())
+
         thormap: ProcTHORMap | iTHORMap | None = None
         if "FloorPlan" in scene_xml.stem:
             thormap = iTHORMap.from_mj_model_path(

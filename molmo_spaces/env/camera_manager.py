@@ -10,6 +10,7 @@ import logging
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+import mujoco as mj
 import numpy as np
 from numpy.typing import NDArray
 from scipy.spatial.transform import Rotation as R
@@ -204,6 +205,261 @@ class RobotMountedCamera(Camera):
         return True
 
 
+class AnimatedCamera(Camera):
+    """Wrapper that adds time-varying roll and smooth curved translation to any camera.
+
+    Roll rotates the up vector around the forward axis at a constant angular speed.
+    Non-wrist cameras additionally drift along a cubic Bezier curve between the
+    camera's original position and a randomly chosen destination, ping-ponging
+    back and forth.  A raycast check prevents paths that clip through geometry.
+    """
+
+    _PATH_CHECK_SAMPLES = 10
+    _MAX_PATH_ATTEMPTS = 8
+    _COLLISION_MARGIN = 0.05  # meters clearance from geometry
+
+    def __init__(
+        self,
+        inner: Camera,
+        roll_amplitude: float,
+        roll_speed_range: tuple[float, float],
+        pitch_amplitude: float = 0.0,
+        pitch_speed_range: tuple[float, float] = (0.1, 1.0),
+        yaw_amplitude: float = 0.0,
+        yaw_speed_range: tuple[float, float] = (0.1, 1.0),
+        enable_translation: bool = False,
+        travel_distance: float = 0.15,
+        travel_speed: float = 0.06,
+    ) -> None:
+        """
+        Args:
+            inner: The camera to wrap.
+            roll_amplitude: Max roll angle (radians) in each direction.
+            roll_speed_range: (min, max) angular speed (rad/s) for each roll segment.
+            pitch_amplitude: Max pitch angle (radians) in each direction.
+            pitch_speed_range: (min, max) angular speed (rad/s) for each pitch segment.
+            yaw_amplitude: Max yaw angle (radians) in each direction.
+            yaw_speed_range: (min, max) angular speed (rad/s) for each yaw segment.
+            enable_translation: Whether to apply curved-path positional drift.
+            travel_distance: Distance (meters) from origin to the path endpoint.
+            travel_speed: Speed along the path (meters per second).
+        """
+        super().__init__(inner.name, inner.pos.copy(), inner.forward.copy(), inner.up.copy(), inner.fov)
+        self.inner = inner
+        self._roll_amplitude = roll_amplitude
+        self._roll_speed_min = roll_speed_range[0]
+        self._roll_speed_max = roll_speed_range[1]
+        self._pitch_amplitude = pitch_amplitude
+        self._pitch_speed_min = pitch_speed_range[0]
+        self._pitch_speed_max = pitch_speed_range[1]
+        self._yaw_amplitude = yaw_amplitude
+        self._yaw_speed_min = yaw_speed_range[0]
+        self._yaw_speed_max = yaw_speed_range[1]
+        self.enable_translation = enable_translation
+        self._travel_distance = travel_distance
+        self._travel_speed = travel_speed
+
+        self._rng = np.random.default_rng()
+        self._roll_current: float = 0.0
+        self._roll_target: float = self._rng.uniform(-roll_amplitude, roll_amplitude)
+        self._roll_segment_speed: float = self._rng.uniform(self._roll_speed_min, self._roll_speed_max)
+        self._pitch_current: float = 0.0
+        self._pitch_target: float = self._rng.uniform(-pitch_amplitude, pitch_amplitude) if pitch_amplitude > 0 else 0.0
+        self._pitch_segment_speed: float = self._rng.uniform(self._pitch_speed_min, self._pitch_speed_max)
+        self._yaw_current: float = 0.0
+        self._yaw_target: float = self._rng.uniform(-yaw_amplitude, yaw_amplitude) if yaw_amplitude > 0 else 0.0
+        self._yaw_segment_speed: float = self._rng.uniform(self._yaw_speed_min, self._yaw_speed_max)
+        self._last_t: float = 0.0
+
+        # Bezier control points (world space) — generated on first update so
+        # we can raycast against the loaded scene.
+        self._bezier_p0: NDArray[np.float32] | None = None
+        self._bezier_p1: NDArray[np.float32] | None = None
+        self._bezier_p2: NDArray[np.float32] | None = None
+        self._bezier_p3: NDArray[np.float32] | None = None
+        self._path_length: float = 0.0
+
+    def __getattr__(self, name: str):
+        """Delegate attribute lookups to the wrapped inner camera so that
+        consumers (e.g. freeze_task_config) can transparently access
+        attributes like reference_body_names, camera_offset, etc."""
+        return getattr(self.inner, name)
+
+    @staticmethod
+    def _rodrigues_rotate(v: NDArray, axis: NDArray, angle: float) -> NDArray:
+        """Rotate vector *v* around unit *axis* by *angle* radians (Rodrigues)."""
+        axis = axis / (np.linalg.norm(axis) + 1e-12)
+        c, s = np.cos(angle), np.sin(angle)
+        return v * c + np.cross(axis, v) * s + axis * np.dot(axis, v) * (1 - c)
+
+    def _cubic_bezier(self, u: float) -> NDArray[np.float32]:
+        """Evaluate cubic Bezier at parameter u in [0, 1]."""
+        inv = 1.0 - u
+        return (
+            inv**3 * self._bezier_p0
+            + 3 * inv**2 * u * self._bezier_p1
+            + 3 * inv * u**2 * self._bezier_p2
+            + u**3 * self._bezier_p3
+        ).astype(np.float32)
+
+    @staticmethod
+    def _approx_bezier_length(p0, p1, p2, p3, n_samples: int = 32) -> float:
+        """Approximate arc length of a cubic Bezier by polyline sampling."""
+        length = 0.0
+        prev = p0.copy()
+        for i in range(1, n_samples + 1):
+            u = i / n_samples
+            inv = 1.0 - u
+            pt = inv**3 * p0 + 3 * inv**2 * u * p1 + 3 * inv * u**2 * p2 + u**3 * p3
+            length += float(np.linalg.norm(pt - prev))
+            prev = pt
+        return length
+
+    def _random_unit(self) -> NDArray[np.float32]:
+        v = self._rng.normal(size=3).astype(np.float32)
+        return v / (np.linalg.norm(v) + 1e-12)
+
+    def _path_is_clear(self, model, data) -> bool:
+        """Raycast along the Bezier to check for geometry intersections."""
+        geomid = np.zeros(1, dtype=np.int32)
+        for i in range(self._PATH_CHECK_SAMPLES):
+            u = i / max(self._PATH_CHECK_SAMPLES - 1, 1)
+            pt = self._cubic_bezier(u)
+            # Cast a short ray in several directions to check clearance
+            for direction in [
+                np.array([1, 0, 0], dtype=np.float64),
+                np.array([0, 1, 0], dtype=np.float64),
+                np.array([0, 0, 1], dtype=np.float64),
+            ]:
+                dist = mj.mj_ray(
+                    model, data,
+                    pt.astype(np.float64), direction,
+                    None, 1, -1, geomid,
+                )
+                if 0 < dist < self._COLLISION_MARGIN:
+                    return False
+        return True
+
+    def _generate_path(self, origin: NDArray[np.float32], model, data) -> None:
+        """Pick a destination and build a curved Bezier that avoids geometry."""
+        for _ in range(self._MAX_PATH_ATTEMPTS):
+            dest_dir = self._random_unit()
+            dest = origin + dest_dir * self._travel_distance
+
+            # Control points: offset perpendicular to the straight line for curvature
+            perp = self._random_unit()
+            perp = perp - dest_dir * np.dot(perp, dest_dir)
+            perp = perp / (np.linalg.norm(perp) + 1e-12)
+            bulge = self._rng.uniform(0.3, 0.7) * self._travel_distance
+            mid = (origin + dest) * 0.5 + perp * bulge
+
+            self._bezier_p0 = origin.copy()
+            self._bezier_p1 = (origin * 0.5 + mid * 0.5).astype(np.float32)
+            self._bezier_p2 = (mid * 0.5 + dest * 0.5).astype(np.float32)
+            self._bezier_p3 = dest.astype(np.float32)
+
+            self._path_length = self._approx_bezier_length(
+                self._bezier_p0, self._bezier_p1, self._bezier_p2, self._bezier_p3,
+            )
+
+            if self._path_is_clear(model, data):
+                return
+
+        # All attempts blocked — fall back to a very short safe path
+        self._bezier_p0 = origin.copy()
+        self._bezier_p1 = origin.copy()
+        self._bezier_p2 = origin.copy()
+        self._bezier_p3 = origin.copy()
+        self._path_length = 0.0
+
+    def update_pose(self, env: CPUMujocoEnv) -> bool:
+        self.inner.update_pose(env)
+        t = float(env.current_data.time)
+
+        fwd = self.inner.forward.copy()
+        up = self.inner.up.copy()
+        pos = self.inner.pos.copy()
+
+        # Advance time for all rotation axes
+        dt = t - self._last_t
+        self._last_t = t
+
+        if dt > 0:
+            # Yaw interpolation
+            if self._yaw_amplitude > 0:
+                yd = self._yaw_target - self._yaw_current
+                ys = self._yaw_segment_speed * dt
+                if abs(yd) <= ys:
+                    self._yaw_current = self._yaw_target
+                    self._yaw_target = self._rng.uniform(
+                        -self._yaw_amplitude, self._yaw_amplitude
+                    )
+                    self._yaw_segment_speed = self._rng.uniform(
+                        self._yaw_speed_min, self._yaw_speed_max
+                    )
+                else:
+                    self._yaw_current += float(np.sign(yd)) * ys
+
+            # Pitch interpolation
+            if self._pitch_amplitude > 0:
+                pd = self._pitch_target - self._pitch_current
+                ps = self._pitch_segment_speed * dt
+                if abs(pd) <= ps:
+                    self._pitch_current = self._pitch_target
+                    self._pitch_target = self._rng.uniform(
+                        -self._pitch_amplitude, self._pitch_amplitude
+                    )
+                    self._pitch_segment_speed = self._rng.uniform(
+                        self._pitch_speed_min, self._pitch_speed_max
+                    )
+                else:
+                    self._pitch_current += float(np.sign(pd)) * ps
+
+            # Roll interpolation
+            rd = self._roll_target - self._roll_current
+            rs = self._roll_segment_speed * dt
+            if abs(rd) <= rs:
+                self._roll_current = self._roll_target
+                self._roll_target = self._rng.uniform(
+                    -self._roll_amplitude, self._roll_amplitude
+                )
+                self._roll_segment_speed = self._rng.uniform(
+                    self._roll_speed_min, self._roll_speed_max
+                )
+            else:
+                self._roll_current += float(np.sign(rd)) * rs
+
+        # Apply rotations: yaw, then pitch, then roll
+        if self._yaw_amplitude > 0:
+            fwd = self._rodrigues_rotate(fwd, up, self._yaw_current)
+        if self._pitch_amplitude > 0:
+            right = np.cross(fwd, up)
+            right = right / (np.linalg.norm(right) + 1e-12)
+            fwd = self._rodrigues_rotate(fwd, right, self._pitch_current)
+            up = self._rodrigues_rotate(up, right, self._pitch_current)
+        up = self._rodrigues_rotate(up, fwd, self._roll_current)
+
+        # Smooth curved translation (non-wrist cameras only)
+        if self.enable_translation:
+            if self._bezier_p0 is None:
+                self._generate_path(pos, env.current_model, env.current_data)
+
+            if self._path_length > 1e-6:
+                dist_traveled = self._travel_speed * t
+                # Ping-pong: forward on even legs, backward on odd legs
+                legs = dist_traveled / self._path_length
+                leg_int = int(legs)
+                frac = legs - leg_int
+                u = frac if leg_int % 2 == 0 else 1.0 - frac
+                pos = self._cubic_bezier(u)
+
+        self.pos = pos.astype(np.float32)
+        self.forward = fwd.astype(np.float32)
+        self.up = up.astype(np.float32)
+        self.fov = self.inner.fov
+        return True
+
+
 class CameraRegistry:
     """Registry for camera objects with auto-updating support."""
 
@@ -318,6 +574,11 @@ class CameraManager:
                 log.warning(
                     f"[CAMERA SETUP] Unknown camera spec type: {type(camera_spec).__name__}"
                 )
+
+        # Wrap cameras with animation if the config carries animation parameters
+        if hasattr(camera_system_config, "animation_config") and camera_system_config.animation_config is not None:
+            if not deterministic_only:
+                self.wrap_cameras_with_animation(camera_system_config.animation_config)
 
         # Clean up
         self._workspace_center = None
@@ -715,6 +976,61 @@ class CameraManager:
                 f"[CAMERA SETUP] Failed to place exocentric camera '{camera_config.name}' "
                 f"within visibility constraints after {camera_config.max_placement_attempts} attempts"
             )
+
+    def wrap_cameras_with_animation(self, animation_config) -> None:
+        """Wrap all registered cameras in AnimatedCamera for per-step motion.
+
+        Args:
+            animation_config: CameraAnimationConfig with roll/translation parameters.
+        """
+        wrist_names = set(animation_config.wrist_camera_names)
+        rng = np.random.default_rng()
+
+        wrapped: dict[str, Camera] = {}
+        for name, cam in list(self.registry.cameras.items()):
+            if name in wrist_names:
+                wrapped[name] = cam
+                log.info(
+                    f"[CAMERA SETUP] Skipping animation for wrist camera '{name}'"
+                )
+                continue
+            roll_amplitude = rng.uniform(
+                animation_config.roll_amplitude_range[0],
+                animation_config.roll_amplitude_range[1],
+            )
+            pitch_amplitude = rng.uniform(
+                animation_config.pitch_amplitude_range[0],
+                animation_config.pitch_amplitude_range[1],
+            )
+            yaw_amplitude = rng.uniform(
+                animation_config.yaw_amplitude_range[0],
+                animation_config.yaw_amplitude_range[1],
+            )
+            travel_distance = rng.uniform(
+                animation_config.travel_distance_range[0],
+                animation_config.travel_distance_range[1],
+            )
+            animated = AnimatedCamera(
+                inner=cam,
+                roll_amplitude=roll_amplitude,
+                roll_speed_range=animation_config.roll_speed_range,
+                pitch_amplitude=pitch_amplitude,
+                pitch_speed_range=animation_config.pitch_speed_range,
+                yaw_amplitude=yaw_amplitude,
+                yaw_speed_range=animation_config.yaw_speed_range,
+                enable_translation=True,
+                travel_distance=travel_distance,
+                travel_speed=animation_config.travel_speed,
+            )
+            wrapped[name] = animated
+            log.info(
+                f"[CAMERA SETUP] Wrapped '{name}' with animation "
+                f"(roll_amp={roll_amplitude:.3f}, pitch_amp={pitch_amplitude:.3f}, "
+                f"yaw_amp={yaw_amplitude:.3f} rad, "
+                f"translate=True, travel_dist={travel_distance:.3f})"
+            )
+
+        self.registry.cameras = wrapped
 
     def add_camera(
         self,

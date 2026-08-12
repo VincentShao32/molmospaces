@@ -509,7 +509,7 @@ class FrankaOmniPurposeCameraSystem(CameraSystemConfig):
     runtime information without modifying the camera config.
     """
 
-    img_resolution: tuple[int, int] = (624, 352)
+    img_resolution: tuple[int, int] = (1024, 576)
     cameras: list[AllCameraTypes] = [
         # Wrist-mounted camera
         MjcfCameraConfig(
@@ -577,6 +577,24 @@ class FrankaOmniPurposeCameraSystem(CameraSystemConfig):
             },
             max_placement_attempts=20,
             allow_relaxed_constraints=False,
+        ),
+    ]
+
+
+class FrankaWristOnlyCameraSystem(CameraSystemConfig):
+    """Franka wrist camera only, for wrist-view point-track generation."""
+
+    img_resolution: tuple[int, int] = (624, 352)
+    cameras: list[AllCameraTypes] = [
+        MjcfCameraConfig(
+            name="wrist_camera_zed_mini",
+            mjcf_name="gripper/wrist_camera",
+            robot_namespace="robot_0/",
+            fov=52.0,
+            fov_noise_degrees=(-4.0, 4.0),
+            pos_noise_range=((-0.015, -0.005, -0.02), (0.015, 0.005, 0.02)),
+            orientation_noise_degrees=(8.0, 4.0, 4.0),
+            record_depth=True,
         ),
     ]
 
@@ -1006,6 +1024,38 @@ class FrankaEvalCameraSystem(CameraSystemConfig):
     ]
 
 
+class CameraAnimationConfig(Config):
+    """Parameters controlling per-step camera animation (target-interpolation rotation + curved path drift).
+
+    Each rotation axis (roll, pitch, yaw) independently picks random target
+    angles within its amplitude bound and rotates toward them at a bounded
+    speed (rad/s), giving direct control over max angular velocity per axis.
+    Translation moves non-wrist cameras along a cubic Bezier curve that
+    ping-pongs between origin and a randomly chosen destination.  The path
+    is raycasted against scene geometry to avoid clipping.
+    """
+
+    roll_amplitude_range: tuple[float, float] = (0.05, 0.25)
+    roll_speed_range: tuple[float, float] = (0.1, 1.0)
+    pitch_amplitude_range: tuple[float, float] = (0.0, 0.0)
+    pitch_speed_range: tuple[float, float] = (0.1, 1.0)
+    yaw_amplitude_range: tuple[float, float] = (0.0, 0.0)
+    yaw_speed_range: tuple[float, float] = (0.1, 1.0)
+    travel_distance_range: tuple[float, float] = (0.10, 0.25)
+    travel_speed: float = 0.06
+    wrist_camera_names: list[str] = ["wrist_camera_zed_mini"]
+
+
+class AnimatedFrankaCameraSystem(FrankaOmniPurposeCameraSystem):
+    """FrankaOmniPurposeCameraSystem with per-step camera animation.
+
+    Non-wrist cameras get rotation (roll/pitch/yaw) and positional drift.
+    Wrist cameras are left untouched (no animation applied).
+    """
+
+    animation_config: CameraAnimationConfig | None = CameraAnimationConfig()
+
+
 AllCameraSystems: TypeAlias = (
     RBY1MjcfCameraSystem
     | RBY1GoProD455CameraSystem
@@ -1014,6 +1064,7 @@ AllCameraSystems: TypeAlias = (
     | FrankaEasyRandomizedDroidCameraSystem
     | FrankaDroidCameraSystem
     | FrankaOmniPurposeCameraSystem
+    | FrankaWristOnlyCameraSystem
     | FrankaRandomizedDroidCameraSystem
     | FrankaGoProD405D455CameraSystem
     | FrankaGoProD405RandomizedCameraSystem
@@ -1021,5 +1072,6 @@ AllCameraSystems: TypeAlias = (
     | FrankaEvalCameraSystem
     | I2rtYamCameraSystem
     | BimanualYamCameraSystem
+    | AnimatedFrankaCameraSystem
     | FrankaEvalCameraSystem
 )

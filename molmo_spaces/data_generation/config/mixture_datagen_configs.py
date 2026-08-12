@@ -64,27 +64,69 @@ def _franka_pick_and_place_point_track() -> MixtureSpec:
         components=(
             MixtureComponent(
                 config_name="FrankaPickAndPlacePointTrack",
-                num_houses=10,
-                samples_per_house=10,
-                point_track_num_points=5000,
+                num_houses=4000,
+                samples_per_house=3,
+                point_track_num_points=32768,
                 point_track_include_background=True,
-                point_track_background_fraction=0.3
+                point_track_background_fraction=0.4,
+                scene_dataset="procthor-10k",
+                data_split="train",
             ),
         ),
     )
 
 @register_mixture("FrankaPickPointTrackOnly")
-def _franka_pick_and_place_point_track() -> MixtureSpec:
+def _franka_pick_point_track_only() -> MixtureSpec:
     """Single-component mixture: just FrankaPickPointTrack at full scale."""
     return MixtureSpec(
         components=(
             MixtureComponent(
                 config_name="FrankaPickPointTrackDebug",
-                num_houses=10,
-                samples_per_house=10,
-                point_track_num_points=32768,
+                num_houses=3000,
+                samples_per_house=1,
+                point_track_num_points=10000,
                 point_track_include_background=True,
-                point_track_background_fraction=0.3
+                point_track_background_fraction=0.2,
+                scene_dataset="procthor-10k",
+                data_split="train",
+            ),
+        ),
+    )
+
+
+@register_mixture("FrankaPickPointTrackAnimatedCamOnly")
+def _franka_pick_point_track_animated_cam() -> MixtureSpec:
+    """Single-component mixture: FrankaPickPointTrack with animated camera motion."""
+    return MixtureSpec(
+        components=(
+            MixtureComponent(
+                config_name="FrankaPickPointTrackAnimatedCam",
+                num_houses=3000,
+                samples_per_house=1,
+                point_track_num_points=5000,
+                point_track_include_background=True,
+                point_track_background_fraction=0.2,
+                scene_dataset="procthor-10k",
+                data_split="train",
+            ),
+        ),
+    )
+
+
+@register_mixture("FrankaPickPointTrackWristOnly")
+def _franka_pick_point_track_wrist_only() -> MixtureSpec:
+    """Franka pick, one wrist-camera episode per house, with 5000 tracks."""
+    return MixtureSpec(
+        components=(
+            MixtureComponent(
+                config_name="FrankaPickPointTrackWristOnly",
+                num_houses=3000,
+                samples_per_house=1,
+                point_track_num_points=5000,
+                point_track_include_background=True,
+                point_track_background_fraction=0.2,
+                scene_dataset="procthor-10k",
+                data_split="train",
             ),
         ),
     )

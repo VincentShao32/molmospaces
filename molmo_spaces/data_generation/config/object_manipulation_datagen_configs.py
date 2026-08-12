@@ -20,12 +20,15 @@ from molmo_spaces.configs.base_pick_and_place_configs import (
 from molmo_spaces.configs.base_pick_and_place_next_to_configs import PickAndPlaceNextToDataGenConfig
 from molmo_spaces.configs.base_pick_config import PickBaseConfig
 from molmo_spaces.configs.camera_configs import (
+    AnimatedFrankaCameraSystem,
+    CameraAnimationConfig,
     FrankaDroidCameraSystem,
     FrankaEasyRandomizedDroidCameraSystem,
     FrankaGoProD405D455CameraSystem,
     FrankaOmniPurposeCameraSystem,
     FrankaRandomizedD405D455CameraSystem,
     FrankaRandomizedDroidCameraSystem,
+    FrankaWristOnlyCameraSystem,
     RBY1GoProD455CameraSystem,
     RBY1OmniPurposeCameraSystem,
 )
@@ -83,20 +86,24 @@ class FrankaPickDroidDataGenConfig(PickBaseConfig):
 class FrankaPickPointTrackDebug(PickBaseConfig):
     """Point tracking generation at scale."""
 
-    scene_dataset: str = "procthor-objaverse"
+    scene_dataset: str = "procthor-10k"
+    data_split: str = "train"  # Data split to use
+
+    use_filament: bool = False
+
     robot_config: BaseRobotConfig = FrankaRobotConfig()
     camera_config: FrankaOmniPurposeCameraSystem = FrankaOmniPurposeCameraSystem()
     output_dir: Path = ASSETS_DIR / "experiment_output" / "datagen" / "pick_point_track"
     task_sampler_config: PickTaskSamplerConfig = PickTaskSamplerConfig(
         task_sampler_class=PickTaskSampler,
-        house_inds=random.sample(range(99925), k=3000),
-        samples_per_house=10,
+        house_inds=random.sample(range(9000), k=100),
+        samples_per_house=1,
     )
-    num_workers: int = 1
+    num_workers: int = 6
     use_wandb: bool = False
     filter_for_successful_trajectories: bool = False
     generate_point_tracks: bool = True
-    point_track_num_points: int = 5000
+    point_track_num_points: int = 32768
     point_track_sampling: str = "image"
     point_track_query_interval: int = 20
     point_tracks_only: bool = True
@@ -106,18 +113,55 @@ class FrankaPickPointTrackDebug(PickBaseConfig):
         return "franka_pick_point_track_debug"
 
 
+@register_config("FrankaPickPointTrackAnimatedCam")
+class FrankaPickPointTrackAnimatedCam(FrankaPickPointTrackDebug):
+    """Point tracking generation with animated camera motion (oscillating roll + curved path)."""
+
+    use_filament: bool = False
+
+    camera_config: AnimatedFrankaCameraSystem = AnimatedFrankaCameraSystem(
+        img_resolution=(624, 352),
+        animation_config=CameraAnimationConfig(
+            roll_amplitude_range=(0.05, 6.0),
+            roll_speed_range=(0.1, 1.5),
+            pitch_amplitude_range=(0.0, 2.0),
+            pitch_speed_range=(0.1, 0.7),
+            yaw_amplitude_range=(0.0, 2.0),
+            yaw_speed_range=(0.1, 0.7),
+            travel_distance_range=(0.10, 0.75),
+            travel_speed=0.1,
+        ),
+    )
+
+    @property
+    def tag(self) -> str:
+        return "franka_pick_point_track_animated_cam"
+
+
+@register_config("FrankaPickPointTrackWristOnly")
+class FrankaPickPointTrackWristOnly(FrankaPickPointTrackDebug):
+    """Franka pick point tracks and RGB video from only the wrist camera."""
+
+    camera_config: FrankaWristOnlyCameraSystem = FrankaWristOnlyCameraSystem()
+
+    @property
+    def tag(self) -> str:
+        return "franka_pick_point_track_wrist_only"
+
+
 @register_config("FrankaPickAndPlacePointTrack")
 class FrankaPickAndPlacePointTrack(PickAndPlaceDataGenConfig):
     """Pick-and-place with point tracking."""
 
-    scene_dataset: str = "procthor-objaverse"
+    scene_dataset: str = "procthor-10k"
+    data_split: str = "train"
     robot_config: BaseRobotConfig = FrankaRobotConfig()
     camera_config: FrankaOmniPurposeCameraSystem = FrankaOmniPurposeCameraSystem()
     output_dir: Path = ASSETS_DIR / "experiment_output" / "datagen" / "pick_and_place_point_track"
     task_sampler_config: PickAndPlaceTaskSamplerConfig = PickAndPlaceTaskSamplerConfig(
         task_sampler_class=PickAndPlaceTaskSampler,
-        house_inds=random.sample(range(99925), k=3000),
-        samples_per_house=10,
+        house_inds=random.sample(range(9000), k=4000),
+        samples_per_house=3
     )
     num_workers: int = 8
     use_wandb: bool = False

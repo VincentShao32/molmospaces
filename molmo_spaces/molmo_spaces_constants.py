@@ -120,6 +120,28 @@ DATA_TYPE_TO_SOURCE_TO_VERSION = dict(
 )
 
 _RESOURCE_MANAGER = None
+SCENES_TO_FORCE_INSTALL = ("procthor-10k-train",)
+
+
+def _download_excluded_sources() -> set[tuple[str, str]]:
+    """Parse MLSPACES_DOWNLOAD_EXCLUDE_SOURCES.
+
+    Format: comma-separated ``<data_type>:<source>`` pairs. The bulk
+    ``MLSPACES_DOWNLOAD_EXTRACT_ALL_SCENES_OBJECTS_GRASPS`` path will skip any
+    matching (data_type, source) so you can e.g. avoid pulling
+    ``scenes:holodeck-objaverse-train`` when you only care about procthor.
+    """
+    raw = os.environ.get("MLSPACES_DOWNLOAD_EXCLUDE_SOURCES", "").strip()
+    if not raw:
+        return set()
+    excluded: set[tuple[str, str]] = set()
+    for token in raw.split(","):
+        token = token.strip()
+        if not token or ":" not in token:
+            continue
+        data_type, source = token.split(":", 1)
+        excluded.add((data_type.strip(), source.strip()))
+    return excluded
 
 
 def get_resource_manager(force_post_setup: bool = False):
@@ -131,15 +153,22 @@ def get_resource_manager(force_post_setup: bool = False):
                 os.environ.get("MLSPACES_DOWNLOAD_EXTRACT_ALL_SCENES_OBJECTS_GRASPS", "False")
             ):
                 # extract to cache only; link on demand (per-file for scenes)
-                manager.install_all_for_data_type("scenes", skip_linking=True)
-                manager.install_all_for_data_type("objects")
-                manager.install_all_for_data_type("grasps")
+                excluded = _download_excluded_sources()
+                for data_type, skip_link in (
+                    ("scenes", True),
+                    ("objects", False),
+                    ("grasps", False),
+                ):
+                    for source in DATA_TYPE_TO_SOURCE_TO_VERSION.get(data_type, {}):
+                        if (data_type, source) in excluded:
+                            continue
+                        kwargs = {"skip_linking": True} if skip_link else {}
+                        manager.install_all_for_source(data_type, source, **kwargs)
             else:
                 to_install = {}
                 for scene_source in DATA_TYPE_TO_SOURCE_TO_VERSION["scenes"]:
                     source_packages = manager.find_all_packages_for_source("scenes", scene_source)
-                    if len(source_packages) < 10:
-                        # Fully install small scene datasets
+                    if len(source_packages) < 10 or scene_source in SCENES_TO_FORCE_INSTALL:                        # Fully install small scene datasets
                         packages = source_packages
                     else:
                         # Install unindexed scene archives
