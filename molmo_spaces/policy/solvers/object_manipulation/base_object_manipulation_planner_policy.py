@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+import gymnasium.spaces as gyms
 import mujoco
 import numpy as np
 from mujoco import MjSpec
@@ -11,11 +12,13 @@ from scipy.spatial.transform import Rotation as R
 
 from molmo_spaces.configs.abstract_exp_config import MlSpacesExpConfig
 from molmo_spaces.configs.policy_configs import ObjectManipulationPlannerPolicyConfig
+from molmo_spaces.env.abstract_sensors import Sensor
 from molmo_spaces.policy.base_policy import PlannerPolicy
 from molmo_spaces.robots.robot_views.abstract import RobotView
 from molmo_spaces.tasks.task import BaseMujocoTask
 from molmo_spaces.utils.grasp_sample import add_grasp_collision_bodies
 from molmo_spaces.utils.linalg_utils import transform_to_twist, twist_to_transform
+from molmo_spaces.utils.pose import pose_mat_to_7d
 from molmo_spaces.utils.profiler_utils import Timer
 
 log = logging.getLogger(__name__)
@@ -23,6 +26,11 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class MoveSegment:
+    """
+    A move segment is a single movement in a MoveSequence,
+    i.e. moving from a point to another point.
+    """
+
     name: str
 
     @property
@@ -32,6 +40,11 @@ class MoveSegment:
 
 @dataclass
 class TCPMoveSegment(MoveSegment):
+    """
+    A move segment that moves the robot TCP to a target pose.
+    The movement is a straight line in task space.
+    """
+
     start_pose: np.ndarray
     end_pose: np.ndarray
     speed: float
@@ -44,6 +57,11 @@ class TCPMoveSegment(MoveSegment):
 
 @dataclass
 class JointMoveSegment(MoveSegment):
+    """
+    A move segment that moves the robot joints to a target configuration.
+    The movement is a straight line in joint space.
+    """
+
     start_qpos: (
         dict[str, np.ndarray | list[float]] | None
     )  # if None, use the qpos at the start of the segment
@@ -56,6 +74,11 @@ class JointMoveSegment(MoveSegment):
 
 
 class ActionPrimitive(ABC):
+    """
+    Abstract base class for action primitives.
+    An action primitive is a single action that can be executed by the robot.
+    """
+
     def __init__(self, robot_view: RobotView, duration: float):
         self.robot_view = robot_view
         self.duration = duration
@@ -83,6 +106,12 @@ class ActionPrimitive(ABC):
 
 
 class MoveSequence(ActionPrimitive):
+    """
+    A sequence of (TCP or joint) move segments executed sequentially without pauses.
+    The sequence is terminated when the last move segment is completed, after
+    a settling period.
+    """
+
     def __init__(
         self,
         robot_view: RobotView,
@@ -167,6 +196,13 @@ class MoveSequence(ActionPrimitive):
 
 
 class TCPMoveSequence(MoveSequence):
+    """
+    Action primitive that tracks a trajectory in task space.
+    Waypoints are interpolated linearly in task space.
+    The sequence is terminated after the cumulative duration of the move segments,
+    plus the settling period.
+    """
+
     def __init__(
         self,
         robot_view: RobotView,
@@ -234,6 +270,13 @@ class TCPMoveSequence(MoveSequence):
 
 
 class JointMoveSequence(MoveSequence):
+    """
+    Action primitive that tracks a trajectory in joint space.
+    Waypoints are interpolated linearly in joint space.
+    The sequence is terminated after the cumulative duration of the move segments,
+    plus the settling period.
+    """
+
     def __init__(
         self,
         robot_view: RobotView,
@@ -288,6 +331,10 @@ class JointMoveSequence(MoveSequence):
 
 
 class GripperAction(ActionPrimitive):
+    """
+    Action primitive that opens or closes the gripper.
+    """
+
     def __init__(self, robot_view: RobotView, target_open: bool, duration: float) -> None:
         super().__init__(robot_view, duration)
         self.target_open = target_open
@@ -317,6 +364,10 @@ class GripperAction(ActionPrimitive):
 
 
 class NoopAction(ActionPrimitive):
+    """
+    Action primitive that does nothing for a given duration.
+    """
+
     def __init__(self, robot_view: RobotView, duration: float) -> None:
         super().__init__(robot_view, duration)
         self._action = None
@@ -332,7 +383,36 @@ class NoopAction(ActionPrimitive):
         return self._action
 
 
+class GraspPoseSensor(Sensor):
+    """Sensor for the planned grasp pose in 7D format."""
+
+    def __init__(self, uuid: str = "grasp_pose") -> None:
+        observation_space = gyms.Box(low=-np.inf, high=np.inf, shape=(7,), dtype=np.float32)
+        super().__init__(uuid=uuid, observation_space=observation_space)
+        self._logged_warning = False
+
+    def get_observation(self, env, task, batch_index: int = 0, *args, **kwargs) -> np.ndarray:
+        """Get grasp pose (using current TCP pose as proxy)."""
+        if task._registered_policy is not None:
+            assert isinstance(task._registered_policy, BaseObjectManipulationPlannerPolicy)
+            return np.array(
+                pose_mat_to_7d(task._registered_policy.target_poses["grasp"]),
+                dtype=np.float32,
+            )
+        else:
+            if not self._logged_warning:
+                log.warning("Policy is not registered or does not support grasp pose sensing.")
+                self._logged_warning = True
+            return np.zeros(7, dtype=np.float32)
+
+
 class BaseObjectManipulationPlannerPolicy(PlannerPolicy):
+    """
+    Base class for object manipulation (open/close/pick/pick-place) planner policies.
+    This class provides common functionality for object manipulation planner policies,
+    including concatenating multiple action primitives into a single trajectory.
+    """
+
     def __init__(self, config: MlSpacesExpConfig, task: BaseMujocoTask) -> None:
         assert isinstance(config.policy_config, ObjectManipulationPlannerPolicyConfig)
         super().__init__(config, task)
@@ -341,19 +421,28 @@ class BaseObjectManipulationPlannerPolicy(PlannerPolicy):
 
         self.action_primitives = []
         self.action_idx = 0
-        self.retry_count = 0
+        self._retry_count = 0
         self.target_poses = {}
         self.ik_warmed_up = False
         self.sequential_ik_failures = 0
 
     @property
+    def retry_count(self) -> int:
+        return self._retry_count
+
+    @property
     def planners(self):
         return {}
 
+    def create_policy_sensors(self) -> list[Sensor]:
+        return super().create_policy_sensors() + [
+            GraspPoseSensor(uuid="grasp_pose"),
+        ]
+
     def get_all_phases(self):
-        phases = super().get_all_phases()
         # Collect all possible phases here, even those not used for a particular trajectory computation
-        new_phases = {
+        phases = {
+            "unknown": 0,
             "gripper-open": 1,
             "pregrasp": 2,
             "grasp": 3,
@@ -364,7 +453,6 @@ class BaseObjectManipulationPlannerPolicy(PlannerPolicy):
             "retreat": 8,
             "go_home": 9,
         }
-        phases.update(new_phases)
         return phases
 
     def reset(self, reset_retries: bool = True):
@@ -380,7 +468,7 @@ class BaseObjectManipulationPlannerPolicy(PlannerPolicy):
 
         self.action_idx = 0
         if reset_retries:
-            self.retry_count = 0
+            self._retry_count = 0
 
         self.target_poses = {}
         for action_primitive in self.action_primitives:
@@ -429,27 +517,6 @@ class BaseObjectManipulationPlannerPolicy(PlannerPolicy):
     def _compute_trajectory(self) -> list[ActionPrimitive]:
         raise NotImplementedError
 
-    # def _trajectory_to_phases(self, trajectory) -> dict[str, int]:
-    #     policy_phases = {"unknown": 0}
-    #     phase_idx = len(policy_phases)
-
-    #     for traj_element in trajectory:
-    #         if isinstance(traj_element, GripperAction):
-    #             phase_name = traj_element.get_current_phase()
-    #             if phase_name not in policy_phases:
-    #                 policy_phases[phase_name] = phase_idx
-    #                 phase_idx += 1
-
-    #         elif isinstance(traj_element, MoveSequence):
-    #             # iterate over all segments
-    #             for move_element in traj_element.move_segments:
-    #                 phase_name = move_element.name
-    #                 if phase_name not in policy_phases:
-    #                     policy_phases[phase_name] = phase_idx
-    #                     phase_idx += 1
-
-    #     return policy_phases
-
     def _check_for_failures(self) -> bool:
         # TODO(abhayd): check for collision with other objects
         if self.action_idx >= len(self.action_primitives):
@@ -462,7 +529,7 @@ class BaseObjectManipulationPlannerPolicy(PlannerPolicy):
             log.info(f"❌ Max retries ({self.policy_config.max_retries}) exceeded. Task failed.")
             return {"done": True, "success": False}
 
-        self.retry_count += 1
+        self._retry_count += 1
         log.info(
             f"🔄 Failure detected! Initiating retry {self.retry_count}/{self.policy_config.max_retries}"
         )
@@ -513,13 +580,15 @@ class BaseObjectManipulationPlannerPolicy(PlannerPolicy):
                 pose = np.concatenate([pose, np.broadcast_to(pose[-1:], (n_pad, 4, 4))])
 
             robot_view = self.task.env.current_robot.robot_view
-            parallel_kinematics = self.task._env.robots[0].parallel_kinematics
+            parallel_kinematics = self.task.env.current_robot.parallel_kinematics
+            gripper_mg_id = robot_view.get_gripper_movegroup_ids()[0]
             jp_dicts = parallel_kinematics.ik(
+                gripper_mg_id,
                 pose,
+                None,
                 robot_view.get_qpos_dict(),
                 robot_view.base.pose,
                 rel_to_base=False,
-                posture_weight=0.0,
             )
             return np.array([jp_dict is not None for jp_dict in jp_dicts[:batch_size]])
         else:

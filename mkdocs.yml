@@ -1,0 +1,120 @@
+site_name: MolmoSpaces
+site_description: Large scale assets and benchmarks for vision language policies
+site_url: https://allenai.github.io/molmospaces
+repo_url: https://github.com/allenai/molmospaces
+repo_name: allenai/molmospaces
+edit_uri: edit/main/docs/
+copyright: Copyright &copy; 2026 Allen Institute for Artificial Intelligence
+
+theme:
+  name: material
+  logo: images/MolmoSpacesLogo.png
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - navigation.indexes
+    - search.highlight
+    - search.suggest
+    - content.code.copy
+    - content.action.edit
+    - toc.follow
+
+nav:
+  - Home: index.md
+  - Guides:
+      - Key Concepts: concepts.md
+      - Sensors: sensors.md
+      - Built-In Assets: assets.md
+      - Asset and Grasp Libraries: asset_libraries.md
+      - Data Format: data_format.md
+      - Data Processing: data_processing.md
+      - Benchmark Evaluation: evaluation_guide.md
+      - Evaluation Lifecycle: evaluation_lifecycle.md
+      - Code Structure: code_structure.md
+      - Gym Compatibility: gym_compatibility.md
+      - Development: development.md
+      - Tutorials:
+        - "Add a custom robot": tutorials/add_robot.md
+        - "Add a custom asset library": tutorials/custom_assets.md
+  - API Reference:
+      - Overview: api/index.md
+      - molmo_spaces: api/molmo_spaces.md
+      - configs: api/configs.md
+      - controllers: api/controllers.md
+      - data_generation: api/data_generation.md
+      - env: api/env.md
+      - evaluation: api/evaluation.md
+      - kinematics: api/kinematics.md
+      - policy: api/policy.md
+      - renderer: api/renderer.md
+      - resources: api/resources.md
+      - robots: api/robots.md
+      - tasks: api/tasks.md
+      - utils: api/utils.md
+
+plugins:
+  - search
+  - git-revision-date-localized:
+      enable_creation_date: true
+      type: timeago
+  - mkdocstrings:
+      default_handler: python
+      handlers:
+        python:
+          paths: [.]
+          options:
+            extensions:
+              - griffe_inherited_docstrings
+            docstring_style: google
+            docstring_section_style: table
+            show_source: true
+            show_root_heading: true
+            show_root_full_path: false
+            show_symbol_type_heading: true
+            show_symbol_type_toc: true
+            members_order: source
+            merge_init_into_class: true
+            show_submodules: false
+            allow_inspection: false
+            preload_modules: []
+            inherited_members: true
+            show_if_no_docstring: true
+            show_root_toc_entry: true
+            summary: true
+            # type annotation display
+            separate_signature: true
+            show_signature_annotations: true
+            annotations_path: brief
+            signature_crossrefs: true
+
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - admonition
+  - def_list
+  - pymdownx.details
+  - attr_list
+  - md_in_html
+  - github-callouts
+  - toc:
+      permalink: true

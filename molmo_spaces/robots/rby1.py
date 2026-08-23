@@ -1,21 +1,21 @@
-from functools import cached_property
 from typing import TYPE_CHECKING, Any
 
 import mujoco
 import numpy as np
-from mujoco import MjData, MjModel, MjSpec
-from scipy.spatial.transform import Rotation as R
+from mujoco import MjData, MjSpec
 
 from molmo_spaces.controllers.abstract import Controller
+from molmo_spaces.env.rby1_sensors import RBY1GraspStateSensor
 from molmo_spaces.robots.abstract import Robot
 
 if TYPE_CHECKING:
     from molmo_spaces.configs.abstract_exp_config import MlSpacesExpConfig
+    from molmo_spaces.configs.robot_configs import BaseRobotConfig
 from molmo_spaces.controllers.base_pose import DiffDriveBasePoseController
 from molmo_spaces.controllers.joint_pos import JointPosController
 from molmo_spaces.controllers.joint_rel_pos import JointRelPosController
 from molmo_spaces.controllers.torso_height import TorsoHeightJointPosController
-from molmo_spaces.kinematics.rby1_kinematics import RBY1Kinematics
+from molmo_spaces.kinematics.mujoco_kinematics import MlSpacesKinematics
 from molmo_spaces.robots.robot_views.rby1_view import RBY1RobotView
 
 
@@ -48,9 +48,7 @@ class RBY1(Robot):
         self._robot_view = RBY1RobotView(mj_data, self.namespace, holo_base=self._use_holo_base)
 
         # Create kinematic solver:
-        self._kinematics = RBY1Kinematics(
-            self.mj_model, namespace=self.namespace, holo_base=self._use_holo_base
-        )
+        self._kinematics = MlSpacesKinematics(self.exp_config.robot_config)
 
         # Create controllers:
 
@@ -210,48 +208,11 @@ class RBY1(Robot):
     def parallel_kinematics(self):
         raise NotImplementedError("Parallel kinematics not implemented for RBY1")
 
-    @cached_property
-    def state_dim(self) -> int:
-        # return sum of all the joints of interest
-        self._state_dim = 0
-        for move_group in self.robot_view.move_group_ids():
-            if move_group == "base":
-                self._state_dim += 3  # Using only 2D base position (x, y, theta)
-            else:
-                self._state_dim += self.robot_view.get_move_group(move_group).n_joints
-        return self._state_dim
-
-    def action_dim(self, move_group_ids: list) -> int:
-        # return sum of the commanded joints based on the move group ids
-        action_dim = 0
-        if "base" in move_group_ids:
-            if "planar" in self.base_command_mode:
-                action_dim += 3  # actions provided are 2D planar positions / velocities
-            else:
-                action_dim += self._robot_view.get_move_group(
-                    "base"
-                ).n_actuators  # wheel velocities
-        if "torso" in move_group_ids:
-            if self.torso_command_mode == "height":
-                action_dim += 1
-            else:
-                action_dim += self._robot_view.get_move_group("torso").n_actuators
-        if "left_arm" in move_group_ids:
-            if "joint" in self.arm_command_mode:
-                action_dim += self._robot_view.get_move_group("left_arm").n_actuators
-            elif "ee" in self.arm_command_mode:
-                action_dim += 7  # ee pos + orientation (quaternion)
-        if "right_arm" in move_group_ids:
-            if "joint" in self.arm_command_mode:
-                action_dim += self._robot_view.get_move_group("right_arm").n_actuators
-            elif "ee" in self.arm_command_mode:
-                action_dim += 7  # ee pos + orientation (quaternion)
-        if "left_gripper" in move_group_ids:
-            action_dim += self._robot_view.get_move_group("left_gripper").n_actuators
-        if "right_gripper" in move_group_ids:
-            action_dim += self._robot_view.get_move_group("right_gripper").n_actuators
-        # Note: head is not included - RBY1 head actuation is disabled
-        return action_dim
+    def create_robot_sensors(self):
+        return super().create_robot_sensors() + [
+            RBY1GraspStateSensor(uuid="rby1_left_grasp_state", arm_side="left"),
+            RBY1GraspStateSensor(uuid="rby1_right_grasp_state", arm_side="right"),
+        ]
 
     def get_arm_move_group_ids(self) -> list[str]:
         """RBY1 has two independent arms - each gets independent noise."""
@@ -347,107 +308,19 @@ class RBY1(Robot):
 
         return noisy_action
 
-    def update_control(self, action_command_dict: dict[str, Any]) -> None:
-        """Update the control inputs to the robot based on the provided action commands.
-        Args:
-        action_command_dict: Dictionary containing action commands for the robot
-                             based on the move groups ids to be used.
-        """
-        # Loops through all the controllers and updates their control inputs
-        # NOTE: All joints are always controlled. If no action_command is provided, we assume the
-        # controller will maintain the current state of the joint.
-
-        action_command_dict = self._apply_action_noise_and_save_unnoised_cmd_jp(action_command_dict)
-
-        for move_group_id, controller in self.controllers.items():
-            if move_group_id in action_command_dict:
-                action_command = action_command_dict[move_group_id]
-                # send command target for the controller
-                controller.set_target(action_command)
-            else:
-                # If no action command is provided, controller should switch to
-                # stationary mode (if not already set to stationary previously)
-                if not controller.stationary:
-                    controller.set_to_stationary()
-
-    def compute_control(self) -> None:
-        for mg_id, controller in self.controllers.items():
-            ctrl_inputs = controller.compute_ctrl_inputs()
-            self.robot_view.get_move_group(mg_id).ctrl = ctrl_inputs
-
-    def set_joint_pos(self, robot_joint_pos_dict) -> None:
-        """Set all the robot's joint positions to the specified values.
-        Args:
-            robot_joint_pos_dict: Dictionary or SimpleNamespace containing joint positions for the robot
-            based on the move groups ids.
-        """
-        # Handle both dict and SimpleNamespace objects
-        if hasattr(robot_joint_pos_dict, "__dict__"):
-            # SimpleNamespace object
-            items = robot_joint_pos_dict.__dict__.items()
-        else:
-            # Dictionary object
-            items = robot_joint_pos_dict.items()
-
-        for move_group_id, joint_pos in items:
-            if move_group_id in self.robot_view.move_group_ids():
-                move_group = self.robot_view.get_move_group(move_group_id)
-                # set the joint positions
-                move_group.joint_pos = joint_pos
-            else:
-                raise ValueError(f"Move group {move_group_id} not found in robot view.")
-
     def get_world_pose_tf_mat(self):
         """Get the robot's world pose transformation matrix.
+
         Returns:
             np.ndarray: 4x4 transformation matrix for the robot base pose in world frame
         """
         return self.robot_view.get_move_group("base").pose
 
-    def set_world_pose(self, robot_world_pose) -> None:
-        """Set the robot's world pose to the specified location in the world."""
+    def reset(self) -> None:
+        """Reset the robot to its initial state."""
 
-        pose_tf = np.eye(4, dtype=np.float64)
-        if len(robot_world_pose) == 3:
-            # (x, y, theta)
-            x, y, theta = robot_world_pose
-            pose_tf[:2, :2] = np.array(
-                [
-                    [np.cos(theta), -np.sin(theta)],
-                    [np.sin(theta), np.cos(theta)],
-                ]
-            )
-            pose_tf[:3, 3] = np.array([x, y, 0.0])
-        elif len(robot_world_pose) == 7:
-            # (x, y, z, w, x, y, z) (pos + quat, scalar_first)
-            pos = np.array(robot_world_pose[:3], dtype=np.float64)
-            quat = np.array(robot_world_pose[3:], dtype=np.float64)
-            rot_mat = R.from_quat(quat, scalar_first=True).as_matrix()
-            pose_tf[:3, :3] = rot_mat
-            pose_tf[:3, 3] = pos
-        else:
-            raise ValueError(
-                "robot_world_pose must be either (x, y, theta) or (x, y, z, w, x, y, z) (pos + quat, scalar_first)."
-            )
-
-        # The robot_view expects a transformation matrix in the form of a 4x4 numpy array
-        self.robot_view.get_move_group("base").pose = pose_tf
-
-    def reset(self, robot_joint_pos_dict=None, robot_world_pose=None) -> None:
-        """Reset the robot to its initial position or a provided set of positions and world pose."""
-
-        # Load default robot configuration and world pose
         init_qpos_dict = self.exp_config.robot_config.init_qpos
-        default_world_pose = self.exp_config.robot_config.default_world_pose
-        if robot_joint_pos_dict is not None:
-            for move_group_id, joint_pos in robot_joint_pos_dict.items():
-                init_qpos_dict[move_group_id] = joint_pos
-        if robot_world_pose is not None:
-            default_world_pose = robot_world_pose
-        # Set the joint positions
         self.set_joint_pos(init_qpos_dict)
-        # Set the world pose
-        self.set_world_pose(default_world_pose)
 
         # reset controllers
         for _, controller in self._controllers.items():
@@ -479,125 +352,66 @@ class RBY1(Robot):
             count += self._robot_view.get_move_group(move_group_id).n_joints
         return joint_ranges
 
-    def _read_from_sensor(self, sensor_name: str, data: MjData) -> None:
-        # TODO
-        pass
-        # s_adr = self.model.sensor(self.namespace + sensor_name).adr.item()
-        # s_dim = self.model.sensor(self.namespace + sensor_name).dim.item()
-        # return data.sensordata[s_adr : s_adr + s_dim].copy()
-
-    def check_collision(self, model: MjModel, data: MjData, grasped_objs: set[int] = None) -> bool:
-        # TODO
-        pass
-        # # TODO: ignore finger collision with grasped objects
-        # # check if the agent is in collision with any geoms in the scene
-        # agent_id = self.root_id
-        # contacts = data.contact
-        # for c in contacts:
-        #     if c.exclude != 0:
-        #         continue
-        #     body1 = self.model.geom_bodyid[c.geom1]
-        #     body2 = self.model.geom_bodyid[c.geom2]
-
-        #     rootbody1 = self.model.body_rootid[body1]
-        #     rootbody2 = self.model.body_rootid[body2]
-
-        #     if rootbody1 == agent_id or rootbody2 == agent_id:
-        #         # Ignore Collision with gripper tips and target object
-        #         if (
-        #             self.model.body(body1).name == self.left_gripper_geom_name
-        #             or self.model.body(body1).name == self.right_gripper_geom_name
-        #         ) or (
-        #             self.model.body(body2).name == self.left_gripper_geom_name
-        #             or self.model.body(body2).name == self.right_gripper_geom_name
-        #         ):
-        #             if grasped_objs is not None and grasped_objs:
-        #                 if (
-        #                     self.model.body(body1).id in grasped_objs
-        #                     or self.model.body(body2).id in grasped_objs
-        #                 ):
-        #                     continue
-        #             else:
-        #                 continue
-
-        #             # Ignore Collision with itself
-        #             if self.model.body(rootbody1).name == self.model.body(rootbody2).name:
-        #                 continue
-
-        #         # Collision with the floor
-        #         if (
-        #             self.model.body(rootbody2).name == "floor"
-        #             or self.model.body(rootbody1).name == "floor"
-        #         ):
-        #             other_body = body1 if self.model.body(rootbody2).name == "floor" else body2
-        #             if self.model.body(other_body).name in [
-        #                 self.namespace + "fl_wheel_link",
-        #                 self.namespace + "fr_wheel_link",
-        #                 self.namespace + "rl_wheel_link",
-        #                 self.namespace + "rr_wheel_link",
-        #             ]:
-        #                 # print("Collision with floor detected", model.body(body1).name, model.body(body2).name)
-        #                 continue
-        #             # print(
-        #             #    "Collision with floor detected",
-        #             #    self.model.body(body1).name,
-        #             #    self.model.body(body2).name,
-        #             # )
-        #             # return False
-
-        #         print(
-        #             "Collision detected",
-        #             self.model.body(body1).name,
-        #             self.model.body(body2).name,
-        #         )
-        #         return True
-        # return False
-
-    def get_grasped_objs(self, model: MjModel, data: MjData) -> set[int]:
-        """Return a set of grasped object body IDs."""
-        # TODO
-        pass
-        # root_id = model.body_rootid[next(iter(self.finger_body_ids))]
-        # grasped_objs = set()
-        # for c in data.contact:
-        #     if c.exclude != 0:
-        #         continue
-        #     b1 = model.geom_bodyid[c.geom1]
-        #     b2 = model.geom_bodyid[c.geom2]
-
-        #     # ignore all collisions not involving only one finger
-        #     if not ((b1 in self.finger_body_ids) ^ (b2 in self.finger_body_ids)):
-        #         continue
-        #     # ignore self-collisions
-        #     if model.body_rootid[b1] == root_id and model.body_rootid[b2] == root_id:
-        #         continue
-
-        #     if b1 in self.finger_body_ids:
-        #         grasped_objs.add(b2)
-        #     else:
-        #         grasped_objs.add(b1)
-        # grasped_objs = {model.body_rootid[obj_id] for obj_id in grasped_objs}
-
-        # return grasped_objs
-
     @staticmethod
     def robot_model_root_name() -> str:
-        return "base"
+        return "robot_0/base"
+
+    @classmethod
+    def apply_control_overrides(cls, spec: MjSpec, robot_config: "BaseRobotConfig"):
+        # the model root name already includes the hardcoded namespace
+        tmp_robot_config = robot_config.model_copy(deep=True)
+        tmp_robot_config.robot_namespace = ""
+        super().apply_control_overrides(spec, tmp_robot_config)
 
     @classmethod
     def add_robot_to_scene(
         cls,
-        robot_config: "MlSpacesExpConfig.RobotConfig",
+        robot_config: "BaseRobotConfig",
         spec: MjSpec,
-        robot_spec: MjSpec,
         prefix: str,
         pos: list[float],
         quat: list[float],
         randomize_textures: bool = False,
+        strip_meshes: bool = False,
     ) -> None:
+        assert prefix == "robot_0/", "RBY1 robot namespace must be 'robot_0/'"
+
+        # RBY1's own MJCF wraps robot_model_root_name() ("base") inside an
+        # intermediate body carrying a +0.005m Z offset (the same ground-clearance
+        # constant used below for the "world" site). attach_body() only grafts the
+        # specified root and its descendants, so that ancestor -- and its offset --
+        # gets silently dropped, leaving the attached robot ~5mm too low. That's
+        # enough to push its wheels past the named floor body into the raw "world"
+        # ground plane, which check_robot_collision_in_current_pose doesn't
+        # recognize as an exempt floor contact. Reapply the offset here.
+        #
+        # RBY1's MJCF also defines two mocap marker bodies (target_ee_pose_left/
+        # right, used only to visualize task_config.viz_target_ee) as top-level
+        # siblings of that same wrapper body, so they're dropped for the same
+        # reason -- attach_body() only grafts "base"'s own subtree. Unlike the Z
+        # offset, these aren't reattached: they share mesh assets (e.g. "EE_BODY")
+        # with "base"'s own subtree, and MjSpec's attach_body raises on those
+        # shared-asset IDs when attaching a second body from the same source spec.
+        # See check_if_use_flip_side_handle/get_target_ee_pose's model.nmocap
+        # guard for the corresponding graceful fallback.
+        base_pos_3d = pos + [0.0] if len(pos) == 2 else list(pos)
+        base_pos_3d[2] += 0.005
+
         super().add_robot_to_scene(
-            robot_config, spec, robot_spec, prefix, pos, quat, randomize_textures
+            robot_config=robot_config,
+            spec=spec,
+            prefix="",  # elements already have robot_0/ prefix in MJCF
+            pos=base_pos_3d,
+            quat=quat,
+            randomize_textures=randomize_textures,
+            strip_meshes=strip_meshes,
         )
+
+        # RBY1 doesn't support insertion not at the origin or identity rotation
+        # This can be fixed if it's worth the effort (see mobile franka for example)
+        pos_check = pos + [0.0] if len(pos) == 2 else pos
+        assert np.allclose(np.array(pos_check), [0, 0, 0]), "RBY1 insertion position is not zero!"
+        assert np.allclose(np.array(quat), [1, 0, 0, 0]), "RBY1 insertion rotation is not identity!"
 
         def add_slider_act(
             name: str, ctrlrange: float, gainprm: float, biasprm: list[float], gear_idx: int
@@ -621,27 +435,3 @@ class RBY1(Robot):
             add_slider_act("base_x_act", 25, 25000, [0, -25000, 0.5], 0)
             add_slider_act("base_y_act", 25, 25000, [0, -25000, 0.5], 1)
             add_slider_act("base_theta_act", np.pi, 5000, [0, -5000, 0.5], 5)
-
-        # TODO(snehal): don't use bodies in the MJCF, just use visual geoms to render these
-        # add target ee pose bodies
-        ee_viz_right = spec.worldbody.add_body(
-            name="target_ee_pose_right", pos=[0, 0, 0], quat=[1, 0, 0, 0], mocap=True
-        )
-        ee_viz_right.add_site(
-            name="target_ee_pose_right",
-            type=mujoco.mjtGeom.mjGEOM_BOX,
-            size=[0.05, 0.05, 0.05],
-            rgba=[0, 0, 1, 0.3],
-            group=1,
-        )
-
-        ee_viz_left = spec.worldbody.add_body(
-            name="target_ee_pose_left", pos=[0, 0, 0], quat=[1, 0, 0, 0], mocap=True
-        )
-        ee_viz_left.add_site(
-            name="target_ee_pose_left",
-            type=mujoco.mjtGeom.mjGEOM_BOX,
-            size=[0.05, 0.05, 0.05],
-            rgba=[1, 0, 0, 0.3],
-            group=1,
-        )

@@ -8,16 +8,15 @@ Run learned policies on fixed, reproducible benchmarks.
 This README focuses on benchmark installation and running.
 
 ### Related documentation
-- Leaderboard documentation can be found [here](https://docs.google.com/document/d/1aRJ_NGWBzdLk3jJ71GvYx-dj1nbATQbDGfSG3V4Iy0g/export?format=pdf). 
+- Leaderboard documentation can be found [here](https://docs.google.com/document/d/1aRJ_NGWBzdLk3jJ71GvYx-dj1nbATQbDGfSG3V4Iy0g).
 - Submitting results, see the GitHub issue in the repository [here](https://github.com/allenai/molmospaces/issues/8).
-- Theoretical notes on policy comparison can be found [here](https://docs.google.com/document/d/1FcMxJgAQ_2Ojd2uu8HE2MBfD6RE53zcXa55_r8EfPts/export?format=pdf)
-
+- Theoretical notes on policy comparison can be found [here](https://docs.google.com/document/d/1FcMxJgAQ_2Ojd2uu8HE2MBfD6RE53zcXa55_r8EfPts)
 
 ## Concepts
 
 The MolmoSpaces **leaderboard** shows the results of various polices on benchmarks.
 
-**Benchmark Sets** are collections of individual benchmarks that have been released together, e.g., 
+**Benchmark Sets** are collections of individual benchmarks that have been released together, e.g.,
 the ones from the MolmoSpaces paper, prefixed by "MS-" or the ones from the MolmoBot paper prefixed by "MB-".
 
 A **benchmark** is a `benchmark.json` file containing a list of self-contained episode specs. Each spec includes everything needed to recreate a task: scene, robot pose, object poses, cameras, language instructions.
@@ -75,6 +74,10 @@ uv run scripts/serve_policy.py --port=8080 policy:checkpoint \
 
 #### 2. Run the benchmark
 
+Please look at the concrete commands for each task type in our [leaderboard](https://molmospaces.allen.ai/leaderboard):
+- MolmoSpaces tasks (`MS-` prefix): [ms-bench](ms-bench.md)
+- MolmoBot tasks (`MB-` prefix): [mb-bench](mb-bench.md)
+
 If using OpenPI models: `pip install openpi_client`.
 
 For this we chose the easy `MS-Pick` benchmark, which is located here `assets/benchmarks/molmospaces-bench-v1/procthor-10k/FrankaPickDroidMiniBench/FrankaPickDroidMiniBench_json_benchmark_20251231/`.
@@ -94,7 +97,7 @@ Also, see `molmo_spaces/evaluation/configs/evaluation_configs.py` for more examp
 
 #### 3. Run the evaluation
 Finally we run the evaluation output script that aggegates the results as csv files.
-```bash 
+```bash
 python scripts/benchmarks/eval_to_csv.py <eval_output_dir> pi05ft --success-condition oracle  --output-csv data/pick_easy/pi05.csv
 ```
 
@@ -123,9 +126,10 @@ Extend `InferencePolicy`. Must implement `prepare_model`, `reset`, and `get_acti
 # my_repo/policy.py
 from molmo_spaces.policy.base_policy import InferencePolicy
 
+
 class MyPolicy(InferencePolicy):
-    def __init__(self, config, task_type):
-        super().__init__(config, task_type)
+    def __init__(self, config, task):
+        super().__init__(config, task)
         self.camera_names = config.policy_config.camera_names
         self.action_spec = config.policy_config.action_spec
         self.prepare_model()
@@ -157,16 +161,21 @@ Extend `BasePolicyConfig`. Define your model's interface.
 ```python
 # my_repo/configs.py
 from molmo_spaces.configs.policy_configs import BasePolicyConfig
+from molmo_spaces.policy.base_policy import PolicyFactory
+
 
 class MyPolicyConfig(BasePolicyConfig):
     policy_type: str = "learned"
     action_type: str = "joint_pos_rel"
     policy_cls: type = None
+    policy_factory: PolicyFactory | None = None
 
     def model_post_init(self, __context):
         if self.policy_cls is None:
             from my_repo.policy import MyPolicy
-            object.__setattr__(self, "policy_cls", MyPolicy)
+
+            self.policy_cls = MyPolicy
+            self.policy_factory = MyPolicy
 
     checkpoint_path: str
     camera_names: list[str] = ["exo_camera_1", "wrist_camera"]
@@ -183,11 +192,10 @@ Extend `JsonBenchmarkEvalConfig`. This is the minimal config for benchmark eval 
 from molmo_spaces.configs.robot_configs import FrankaRobotConfig
 from molmo_spaces.evaluation.configs.evaluation_configs import JsonBenchmarkEvalConfig
 
+
 class MyEvalConfig(JsonBenchmarkEvalConfig):
     robot_config: FrankaRobotConfig = FrankaRobotConfig()
-    policy_config: MyPolicyConfig = MyPolicyConfig(
-        checkpoint_path="/path/to/default/checkpoint"
-    )
+    policy_config: MyPolicyConfig = MyPolicyConfig(checkpoint_path="/path/to/default/checkpoint")
     policy_dt_ms: float = 200.0  # Match your model's expected control rate
 
     def model_post_init(self, __context):
@@ -196,6 +204,10 @@ class MyEvalConfig(JsonBenchmarkEvalConfig):
 ```
 
 ### 4. Run Evaluation
+
+Please look at the concrete commands for each task type in our [leaderboard](https://molmospaces.allen.ai/leaderboard):
+- MolmoSpaces tasks (`MS-` prefix): [ms-bench](ms-bench.md)
+- MolmoBot tasks (`MB-` prefix): [mb-bench](mb-bench.md)
 
 Command line:
 

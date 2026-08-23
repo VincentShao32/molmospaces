@@ -2,21 +2,24 @@ import abc
 import logging
 from abc import abstractmethod
 from copy import deepcopy
-from functools import cached_property
 from typing import TYPE_CHECKING, Any
 
 import mujoco
 import numpy as np
 from mujoco import MjData, MjSpec
+from scipy.spatial.transform import Rotation as R
 from scipy.stats import truncnorm
+
+from molmo_spaces.controllers.abstract import AbstractPositionController, Controller
+from molmo_spaces.kinematics.mujoco_kinematics import MlSpacesKinematics
+from molmo_spaces.robots.robot_views.abstract import RobotView
 
 if TYPE_CHECKING:
     from molmo_spaces.configs.abstract_exp_config import MlSpacesExpConfig
     from molmo_spaces.configs.robot_configs import ActionNoiseConfig, BaseRobotConfig
+    from molmo_spaces.env.abstract_sensors import Sensor
     from molmo_spaces.kinematics.parallel.parallel_kinematics import ParallelKinematics
-from molmo_spaces.controllers.abstract import AbstractPositionController, Controller
-from molmo_spaces.kinematics.mujoco_kinematics import MlSpacesKinematics
-from molmo_spaces.robots.robot_views.abstract import RobotView
+
 
 log = logging.getLogger(__name__)
 
@@ -61,26 +64,16 @@ class Robot:
         """One or more controllers for the robot joints / wheels / etc."""
         raise NotImplementedError
 
-    @cached_property
-    @abc.abstractmethod
-    def state_dim(self) -> int:
-        """sum of all the joints of interest, which defines the state of the robot."""
-        raise NotImplementedError
-
-    @abc.abstractmethod
-    def action_dim(self, move_group_ids: list[str]) -> int:
-        """sum of the commanded joints, which defines the action space of the robot.
-        Args:
-            move_group_ids: list of move group ids to consider for the action space
-        """
-        raise NotImplementedError
-
     def set_stationary(self) -> None:
         """Set all controllers of the robot to stationary mode (if not already set),
         i.e., hold current positions or zero velocities."""
         for _, controller in self.controllers.items():
             if not controller.stationary:
                 controller.set_to_stationary()
+
+    def create_robot_sensors(self) -> list["Sensor"]:
+        """Get robot-specific sensors that should be registerd with a Task's sensor suite."""
+        return []
 
     def get_arm_move_group_ids(self) -> list[str]:
         """Get the move group IDs that should have TCP-bounded noise applied.
@@ -173,15 +166,7 @@ class Robot:
         # Combine into TCP space noise
         tcp_noise = np.concatenate([position_noise, rotation_noise])
 
-        # Note: For reference of the original two implementations that resulting in this merging...
-        # if use_truncated_gaussian:
-        #     # Map TCP noise back to joint space via least-squares solve
-        #     joint_noise, _, _, _ = np.linalg.lstsq(J, tcp_noise, rcond=None)
-        # else:
-        #     # Map TCP noise back to joint space via Jacobian pseudo-inverse
-        #     J_pinv = np.linalg.pinv(J)
-        #     joint_noise = J_pinv @ tcp_noise
-        # default to least squares (which might also be used internally in the pseudo inverse, but I don't feel like looking for it)
+        # Map TCP noise back to joint space via least-squares solve
         joint_noise, _, _, _ = np.linalg.lstsq(J, tcp_noise, rcond=None)
 
         # Add noise to commanded joint positions
@@ -260,8 +245,7 @@ class Robot:
 
         return self.apply_action_noise(action)
 
-    @abc.abstractmethod
-    def update_control(self, action_command_dict) -> None:
+    def update_control(self, action_command_dict: dict[str, np.ndarray]) -> None:
         """
         Update the control targets to the robot based on the provided action commands.
         Does not set the control inputs to the robot actuators. See compute_control().
@@ -270,30 +254,59 @@ class Robot:
             action_command_dict: Dictionary containing action commands for the robot
                                  based on the move groups ids to be used.
         """
-        raise NotImplementedError
+        action_command_dict = self._apply_action_noise_and_save_unnoised_cmd_jp(action_command_dict)
 
-    @abc.abstractmethod
+        for mg_id, controller in self.controllers.items():
+            if mg_id in action_command_dict and action_command_dict[mg_id] is not None:
+                controller.set_target(action_command_dict[mg_id])
+            elif not controller.stationary:
+                controller.set_to_stationary()
+
     def compute_control(self) -> None:
         """
         Compute and set the control inputs to the robot actuators based on the
         current state and the targets set by the user.
         Must be called after update_control().
         """
-        raise NotImplementedError
+        for controller in self.controllers.values():
+            ctrl_inputs = controller.compute_ctrl_inputs()
+            controller.robot_move_group.ctrl = ctrl_inputs
 
-    @abc.abstractmethod
-    def set_joint_pos(self, robot_joint_pos_dict) -> None:
+    def set_joint_pos(self, robot_joint_pos_dict: dict[str, np.ndarray]) -> None:
         """Set all the robot's joint positions to the specified values.
+
         Args:
             robot_joint_pos_dict: Dictionary containing joint positions for the robot
-            based on the move groups ids.
+                based on the move groups ids.
         """
-        raise NotImplementedError
+        for mg_id, joint_pos in robot_joint_pos_dict.items():
+            self.robot_view.get_move_group(mg_id).joint_pos = joint_pos
 
-    @abc.abstractmethod
-    def set_world_pose(self, robot_world_pose) -> None:
-        """Set the robot's world pose to the specified location (x-y-yaw) in the world."""
-        raise NotImplementedError
+    def set_world_pose(self, robot_world_pose: np.ndarray | list[float]) -> None:
+        """
+        Set the robot's world pose to the specified pose in the world frame.
+
+        Args:
+            robot_world_pose: The pose of the robot in the world frame.
+                If (4, 4) numpy array, it is assumed to be a transformation matrix.
+                If (3,) list or numpy array, it is assumed to be (x, y, yaw).
+                If (7,) list or numpy array, it is assumed to be (xyz + wxyz).
+        """
+        robot_world_pose = np.asarray(robot_world_pose)
+        if robot_world_pose.shape == (4, 4):
+            pose = robot_world_pose
+        elif robot_world_pose.shape == (3,):
+            pose = np.eye(4)
+            pose[:2, 3] = robot_world_pose[:2]
+            pose[:3, :3] = R.from_euler("Z", robot_world_pose[2]).as_matrix()
+        elif robot_world_pose.shape == (7,):
+            pose = np.eye(4)
+            pose[:3, 3] = robot_world_pose[:3]
+            pose[:3, :3] = R.from_quat(robot_world_pose[3:], scalar_first=True).as_matrix()
+        else:
+            raise ValueError(f"Invalid robot world pose shape: {robot_world_pose.shape}")
+
+        self.robot_view.base.pose = pose
 
     @abc.abstractmethod
     def reset(self) -> None:
@@ -317,6 +330,7 @@ class Robot:
                 body: mujoco.MjsBody
                 body.gravcomp = 1.0
 
+        # TODO: control overrides will break if non-robot actuators are present
         stiffness, damping = robot_config.K_stiffness, robot_config.K_damping
         if stiffness is not None and damping is not None:
             assert len(stiffness) == len(damping), (
@@ -340,33 +354,65 @@ class Robot:
             for i, actuator in enumerate(actuators[: len(damping)]):
                 actuator.biasprm[2] = -damping[i]
 
+        force_limit = robot_config.force_limit
+        if force_limit is not None:
+            log.debug(f"Applying force limits to robot {cls.robot_model_root_name()}")
+            assert len(force_limit) <= len(actuators), (
+                "number of force limits cannot exceed number of actuators"
+            )
+            for i, actuator in enumerate(actuators[: len(force_limit)]):
+                actuator.forcelimited = 1
+                actuator.forcerange[:] = [-force_limit[i], force_limit[i]]
+
+    @classmethod
+    def _load_robot_spec(
+        cls, robot_config: "BaseRobotConfig", strip_meshes: bool = False
+    ) -> MjSpec:
+        """Load the robot MjSpec from the robot config's XML path.
+
+        Args:
+            robot_config: The robot config to load the spec for.
+            strip_meshes: If True, remove all mesh geometries from the spec.
+                Useful for kinematics-only models that don't need visual/collision meshes.
+        """
+        robot_spec = MjSpec.from_file(str(robot_config.get_robot_xml_path()))
+        if strip_meshes:
+            for body in robot_spec.bodies:
+                body: mujoco.MjsBody
+                for geom in body.geoms:
+                    geom: mujoco.MjsGeom
+                    if geom.type == mujoco.mjtGeom.mjGEOM_MESH:
+                        robot_spec.delete(geom)
+        return robot_spec
+
     @classmethod
     def add_robot_to_scene(
         cls,
         robot_config: "BaseRobotConfig",
         spec: MjSpec,
-        robot_spec: MjSpec,
         prefix: str,
         pos: list[float],
         quat: list[float],
         randomize_textures: bool = False,
+        strip_meshes: bool = False,
     ) -> None:
         """
         Add a robot to a scene, taking care of any robot-specific considerations.
+
         Args:
             robot_config: The robot config, of the corresponding derived class (i.e. FrankaConfig for Franka, etc.)
             spec: The scene to insert the robot into
-            robot_spec: The robot model
             prefix: The prefix to use for the robot, i.e. the namespace
             pos: The position to use for the robot, either 2d or 3d. If 2d, the z-coordinate is assumed to be 0.
             quat: The quaternion to use for the robot, in [w, x, y, z] format.
             randomize_textures: Whether to randomize the textures of the robot, if applicable. Not supported by all robots.
+            strip_meshes: If True, remove all mesh geometries before insertion (for kinematics-only models).
         """
         pos = pos + [0.0] if len(pos) == 2 else pos
+        robot_spec = cls._load_robot_spec(robot_config, strip_meshes=strip_meshes)
         robot_root_name = cls.robot_model_root_name()
         attach_frame = spec.worldbody.add_frame(pos=pos, quat=quat)
 
-        # Attach the robot to the base via the frame
         robot_root = robot_spec.body(robot_root_name)
         if robot_root is None:
             raise ValueError(f"Robot {robot_root_name=} not found in {robot_spec}")

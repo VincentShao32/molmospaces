@@ -3,7 +3,6 @@ import logging
 import gymnasium.spaces as gyms
 import numpy as np
 
-from molmo_spaces.configs.robot_configs import RBY1Config
 from molmo_spaces.controllers.abstract import AbstractPositionController
 from molmo_spaces.env.abstract_sensors import Sensor
 from molmo_spaces.env.data_views import create_mlspaces_body
@@ -13,6 +12,7 @@ from molmo_spaces.env.sensors_cameras import (
     CameraSensor,
     DepthSensor,
 )
+from molmo_spaces.policy.base_policy import PlannerPolicy
 from molmo_spaces.robots.abstract import Robot
 from molmo_spaces.tasks.task import BaseMujocoTask
 from molmo_spaces.utils.camera_utils import erode_segmentation_mask, normalize_points
@@ -98,23 +98,27 @@ class RobotStateSensor(Sensor):
 class TCPPoseSensor(Sensor):
     """Sensor for TCP (Tool Center Point / End Effector) pose in 7D format."""
 
-    def __init__(self, uuid: str = "tcp_pose") -> None:
+    def __init__(self, uuid: str = "tcp_pose", gripper_mg_id: str | None = None) -> None:
+        """
+        Args:
+            uuid: Unique identifier for this sensor
+            gripper_mg_id: The move group ID of the gripper to track. If None, the first gripper move group ID will be used.
+        """
+        self._gripper_mg_id = gripper_mg_id
         observation_space = gyms.Box(low=-np.inf, high=np.inf, shape=(7,), dtype=np.float32)
         super().__init__(uuid=uuid, observation_space=observation_space)
 
     def get_observation(self, env, task, batch_index: int = 0, *args, **kwargs) -> np.ndarray:
         """Get TCP pose in robot frame."""
-        try:
-            robot_view = env.robots[batch_index].robot_view
-            # Get TCP pose relative to robot base
+        robot_view = env.robots[batch_index].robot_view
+        # Get TCP pose relative to robot base
+        if self._gripper_mg_id is None:
             gripper_mg_id = robot_view.get_gripper_movegroup_ids()[0]
-            tcp_pose_matrix = robot_view.get_move_group(gripper_mg_id).leaf_frame_to_robot
+        else:
+            gripper_mg_id = self._gripper_mg_id
+        tcp_pose_matrix = robot_view.get_move_group(gripper_mg_id).leaf_frame_to_robot
 
-            return pose_mat_to_7d(tcp_pose_matrix).astype(np.float32)
-
-        except (AttributeError, KeyError) as e:
-            print(f"Warning: Could not get TCP pose: {e}")
-            return np.zeros(7, dtype=np.float32)
+        return pose_mat_to_7d(tcp_pose_matrix).astype(np.float32)
 
 
 class RobotBasePoseSensor(Sensor):
@@ -126,15 +130,10 @@ class RobotBasePoseSensor(Sensor):
 
     def get_observation(self, env, task, batch_index: int = 0, *args, **kwargs) -> np.ndarray:
         """Get robot base pose."""
-        try:
-            robot_view = env.robots[batch_index].robot_view
-            base_pose = robot_view.base.pose
+        robot_view = env.robots[batch_index].robot_view
+        base_pose = robot_view.base.pose
 
-            return pose_mat_to_7d(base_pose).astype(np.float32)
-
-        except (AttributeError, KeyError) as e:
-            print(f"Warning: Could not get robot base pose: {e}")
-            return np.zeros(7, dtype=np.float32)
+        return pose_mat_to_7d(base_pose).astype(np.float32)
 
 
 class ObjectPoseSensor(Sensor):
@@ -460,84 +459,6 @@ class EnvStateSensor(Sensor):
             return empty_data
 
 
-class ActorStateSensor(Sensor):
-    """Sensor for actor (object) states in numerical format."""
-
-    def __init__(self, actor_names: list[str], uuid: str = "actor_states") -> None:
-        self.actor_names = actor_names
-        # Each actor has 13D state: pos(3) + quat(4) + vel(6)
-        observation_space = gyms.Box(
-            low=-np.inf, high=np.inf, shape=(len(actor_names), 13), dtype=np.float32
-        )
-        super().__init__(uuid=uuid, observation_space=observation_space)
-
-    def get_observation(self, env, task, batch_index: int = 0, *args, **kwargs) -> np.ndarray:
-        """Get actor states as numerical array."""
-        try:
-            from molmo_spaces.env.data_views import create_mlspaces_body
-
-            data = env.mj_datas[batch_index]
-            actor_states = []
-
-            for actor_name in self.actor_names:
-                try:
-                    body = create_mlspaces_body(data, actor_name)
-
-                    # Create 13D state: position(3) + quaternion(4) + velocity(6)
-                    actor_state = np.concatenate(
-                        [
-                            body.position,  # 3D position
-                            body.quaternion,  # 4D quaternion [w,x,y,z]
-                            body.velocities[:6],  # 6D velocity (3 linear + 3 angular)
-                        ]
-                    )
-                    actor_states.append(actor_state)
-
-                except Exception:
-                    # Use zeros for missing/invalid actors
-                    actor_states.append(np.zeros(13))
-
-            return np.array(actor_states, dtype=np.float32)
-
-        except (AttributeError, KeyError) as e:
-            print(f"Warning: Could not get actor states: {e}")
-            return np.zeros((len(self.actor_names), 13), dtype=np.float32)
-
-
-class ArticulationStateSensor(Sensor):
-    """Sensor for articulation (robot) state in numerical format."""
-
-    def __init__(self, state_dim: int = 31, uuid: str = "articulation_states") -> None:
-        self.state_dim = state_dim
-        observation_space = gyms.Box(low=-np.inf, high=np.inf, shape=(state_dim,), dtype=np.float32)
-        super().__init__(uuid=uuid, observation_space=observation_space)
-
-    def get_observation(self, env, task, batch_index: int = 0, *args, **kwargs) -> np.ndarray:
-        """Get articulation state as numerical array."""
-        try:
-            robot_view = env.robots[batch_index].robot_view
-
-            # Collect all joint positions and velocities
-            all_qpos = []
-            all_qvel = []
-            for mg_name in robot_view.move_group_ids():
-                mg = robot_view.get_move_group(mg_name)
-                all_qpos.extend(mg.joint_pos)
-                all_qvel.extend(mg.joint_vel)
-
-            # Combine and pad to target dimension
-            combined_state = np.concatenate([all_qpos, all_qvel])
-            padded_state = np.zeros(self.state_dim, dtype=np.float32)
-            actual_length = min(len(combined_state), self.state_dim)
-            padded_state[:actual_length] = combined_state[:actual_length]
-
-            return padded_state
-
-        except (AttributeError, KeyError) as e:
-            print(f"Warning: Could not get articulation state: {e}")
-            return np.zeros(self.state_dim, dtype=np.float32)
-
-
 #
 # Task based sensors
 #
@@ -576,13 +497,13 @@ class GraspStateSensor(Sensor):
             for mg_id in robot_view.get_gripper_movegroup_ids():
                 mg = robot_view.get_move_group(mg_id)
                 self._gripper_geoms[mg_id] = descendant_geoms(
-                    env.mj_model, mg.root_body_id, visual_only=False
+                    env.mj_model, mg.root_body_id, visible_only=False
                 )
 
         if self._object_geoms is None:
             object_body = create_mlspaces_body(env.mj_datas[batch_index], self.object_name)
             self._object_geoms = set(
-                descendant_geoms(model, object_body.body_id, visual_only=False)
+                descendant_geoms(model, object_body.body_id, visible_only=False)
             )
 
         held = True
@@ -672,29 +593,6 @@ class ObjectStartPoseSensor(Sensor):
     def reset(self) -> None:
         """Reset stored initial pose."""
         self._initial_pose = None
-
-
-class ObjectEndPoseSensor(Sensor):
-    """Sensor for target/end object pose in 7D format (x, y, z, qw, qx, qy, qz)."""
-
-    def __init__(self, object_name: str, uuid: str | None = None) -> None:
-        self.object_name = object_name
-        if uuid is None:
-            uuid = f"obj_end_{object_name}"
-
-        observation_space = gyms.Box(low=-np.inf, high=np.inf, shape=(7,), dtype=np.float32)
-        super().__init__(uuid=uuid, observation_space=observation_space)
-
-    def get_observation(self, env, task, batch_index: int = 0, *args, **kwargs) -> np.ndarray:
-        """Get target object pose."""
-        if task.config.task_type in ["pick", "open", "close"]:
-            goal_pose = np.array(task.config.task_config.pickup_obj_goal_pose, dtype=np.float32)
-            return goal_pose
-        else:
-            # TODO(max): fix this
-            goal_pose = np.zeros(7, dtype=np.float32)
-            return goal_pose
-            # raise ValueError(f"Invalid action type {task.config.task_type}")
 
 
 class DoorStateSensor(Sensor):
@@ -1034,6 +932,9 @@ class PolicyPhaseSensor(Sensor):
     def get_observation(self, env, task, batch_index: int = 0, *args, **kwargs) -> int:
         """Return the current phase of the policy as a string encoded as uint8 array."""
         if task._registered_policy is not None:
+            assert isinstance(task._registered_policy, PlannerPolicy), (
+                "PolicyPhaseSensor requires a planner policy"
+            )
             phase_name = task._registered_policy.get_phase()
             all_phases = task._registered_policy.get_all_phases()
             try:
@@ -1064,36 +965,12 @@ class PolicyNumRetriesSensor(Sensor):
                 log.warning("No registered policy, cannot track retries.")
                 self._logged_warning = True
             return 0
-        elif hasattr(policy, "retry_count"):
-            return policy.retry_count
-        else:
-            if not self._logged_warning:
-                log.warning(f"Policy {type(policy)} does not support tracking retries.")
-                self._logged_warning = True
-            return 0
+        assert isinstance(policy, PlannerPolicy), "PolicyNumRetriesSensor requires a planner policy"
+        return policy.retry_count
 
     def reset(self) -> None:
         super().reset()
         self._logged_warning = False
-
-
-class GraspPoseSensor(Sensor):
-    """Sensor for the planned grasp pose in 7D format."""
-
-    def __init__(self, uuid: str = "grasp_pose") -> None:
-        observation_space = gyms.Box(low=-np.inf, high=np.inf, shape=(7,), dtype=np.float32)
-        super().__init__(uuid=uuid, observation_space=observation_space)
-
-    def get_observation(self, env, task, batch_index: int = 0, *args, **kwargs) -> np.ndarray:
-        """Get grasp pose (using current TCP pose as proxy)."""
-        if task._registered_policy is None:
-            log.warning("No registered policy, cannot get grasp pose.")
-            return np.zeros(7, dtype=np.float32)
-        else:
-            return np.array(
-                pose_mat_to_7d(task._registered_policy.target_poses["grasp"]),
-                dtype=np.float32,
-            )
 
 
 def get_core_sensors(exp_config):
@@ -1114,7 +991,9 @@ def get_core_sensors(exp_config):
 
         if not pt_only:
             cam_params = CameraParameterSensor(
-                camera_name=camera_name, uuid=f"sensor_param_{camera_name}"
+                camera_name=camera_name,
+                img_resolution=exp_config.camera_config.img_resolution,
+                uuid=f"sensor_param_{camera_name}",
             )
             sensors.append(cam_params)
 
@@ -1146,54 +1025,11 @@ def get_core_sensors(exp_config):
     # Robot State sensors
     sensors.append(RobotJointPositionSensor(uuid="qpos", max_joints=9))
     sensors.append(RobotJointVelocitySensor(uuid="qvel", max_joints=9))
-    sensors.append(TCPPoseSensor(uuid="tcp_pose"))
     sensors.append(RobotBasePoseSensor(uuid="robot_base_pose"))
 
     # Environment state sensors
     sensors.append(EnvStateSensor(uuid="env_states"))
-
-    # Task pose sensors
-    sensors.append(
-        ObjectStartPoseSensor(
-            object_name=exp_config.task_config.pickup_obj_name, uuid="obj_start_pose"
-        )
-    )
-    sensors.append(
-        ObjectEndPoseSensor(
-            object_name=exp_config.task_config.place_target_name, uuid="obj_end_pose"
-        )
-    )
-    sensors.append(
-        GraspStateSensor(
-            object_name=exp_config.task_config.pickup_obj_name,
-            uuid="grasp_state_pickup_obj",
-        )
-    )
-    # TODO: this kind of hacky hardcoded conditionals should be refactored.
-    # Tasks should register their own task-specific sensors.
-    if (
-        hasattr(exp_config.task_config, "place_receptacle_name")
-        and exp_config.task_config.place_receptacle_name
-    ):
-        sensors.append(
-            GraspStateSensor(
-                object_name=exp_config.task_config.place_receptacle_name,
-                uuid="grasp_state_place_receptacle",
-            )
-        )
-    if isinstance(exp_config.robot_config, RBY1Config):
-        from molmo_spaces.env.rby1_sensors import RBY1GraspStateSensor
-
-        sensors.append(RBY1GraspStateSensor(uuid="rby1_left_grasp_state", arm_side="left"))
-        sensors.append(RBY1GraspStateSensor(uuid="rby1_right_grasp_state", arm_side="right"))
-
     sensors.append(TaskInfoSensor(uuid="task_info"))
-
-    sensors.append(GraspPoseSensor(uuid="grasp_pose"))
-
-    # Policy sensors
-    sensors.append(PolicyPhaseSensor(uuid="policy_phase"))
-    sensors.append(PolicyNumRetriesSensor(uuid="policy_num_retries"))
 
     # Action sensors
     sensors.append(
@@ -1208,16 +1044,6 @@ def get_core_sensors(exp_config):
 
     # Object tracking sensors
     sensors.append(ObjectImagePointsSensor(exp_config=exp_config))
-
-    # Legacy sensors for debugging
-    sensors.append(RobotStateSensor(uuid="robot_state"))
-    sensors.append(
-        ObjectPoseSensor(
-            object_names=exp_config.task_config.tracked_object_names
-            or [exp_config.task_config.pickup_obj_name, exp_config.task_config.place_target_name],
-            uuid="object_poses",
-        )
-    )
 
     return sensors
 
@@ -1239,7 +1065,9 @@ def get_nav_task_sensors(exp_config):
 
         # Camera parameter sensor
         cam_params = CameraParameterSensor(
-            camera_name=camera_name, uuid=f"sensor_param_{camera_name}"
+            camera_name=camera_name,
+            img_resolution=exp_config.camera_config.img_resolution,
+            uuid=f"sensor_param_{camera_name}",
         )
         sensors.append(cam_params)
 

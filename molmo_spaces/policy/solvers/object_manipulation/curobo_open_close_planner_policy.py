@@ -1,6 +1,6 @@
 import logging
 import random
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 import mujoco
@@ -24,7 +24,7 @@ from molmo_spaces.utils.constants.object_constants import (
     EXTENDED_ARTICULATION_TYPES_THOR,
     RECEPTACLE_TYPES_THOR,
 )
-from molmo_spaces.utils.grasp_sample import get_all_grasp_poses
+from molmo_spaces.utils.grasps import get_joint_grasps
 from molmo_spaces.utils.mj_model_and_data_utils import body_aabb, descendant_geoms, geom_aabb
 from molmo_spaces.utils.pose import pose_mat_to_7d
 from molmo_spaces.utils.profiler_utils import Timer
@@ -32,7 +32,7 @@ from molmo_spaces.utils.profiler_utils import Timer
 log = logging.getLogger(__name__)
 
 
-class OpenClosePhase(str, Enum):
+class OpenClosePhase(StrEnum):
     HEIGHT_SELECTION = "height_selection"
     PREGRASP = "pregrasp"
     GRASP = "grasp"
@@ -339,7 +339,6 @@ class CuroboOpenClosePlannerPolicy(CuroboPlannerPolicy, OpenClosePlannerPolicy):
         from scipy.spatial.transform import Rotation as R
 
         from molmo_spaces.utils.grasp_sample import get_noncolliding_grasp_mask
-        from molmo_spaces.utils.pose import pos_quat_to_pose_mat
 
         task_config = self.config.task_config
         om = self.task.env.object_managers[self.task.env.current_batch_index]
@@ -348,14 +347,18 @@ class CuroboOpenClosePlannerPolicy(CuroboPlannerPolicy, OpenClosePlannerPolicy):
         data = self.task.env.current_data
 
         # Get all grasp poses
-        grasp_poses_world, _, object_pose = get_all_grasp_poses(self, pickup_obj)
+        grasp_poses_world, object_pose = get_joint_grasps(
+            self.task.env,
+            pickup_obj,
+            self.config.task_config.joint_index,
+            grasp_libraries=self.config.policy_config.grasp_libraries,
+        )
 
         # Get current TCP position
-        tcp_pose_arr = self.task.sensor_suite.sensors["tcp_pose"].get_observation(
-            self.task._env, self.task
-        )
-        tcp_pose = pos_quat_to_pose_mat(tcp_pose_arr[0:3], tcp_pose_arr[3:7])
-        tcp_pose_world = self.task._env.current_robot.robot_view.base.pose @ tcp_pose
+        gripper_mg_id = self.task.env.current_robot.robot_view.get_gripper_movegroup_ids()[0]
+        tcp_pose_world = self.task.env.current_robot.robot_view.get_move_group(
+            gripper_mg_id
+        ).leaf_frame_to_world
         tcp_pose_inv = np.linalg.inv(tcp_pose_world)
 
         dist_tcp = tcp_pose_inv @ grasp_poses_world
@@ -568,7 +571,7 @@ class CuroboOpenClosePlannerPolicy(CuroboPlannerPolicy, OpenClosePlannerPolicy):
 
         pickup_obj = om.get_object_by_name(self.config.task_config.pickup_obj_name)
         pickup_aabb_center, pickup_aabb_size = body_aabb(
-            model, data, pickup_obj.body_id, visual_only=False
+            model, data, pickup_obj.body_id, visible_only=False
         )
 
         for name in target_object_names:
@@ -596,7 +599,7 @@ class CuroboOpenClosePlannerPolicy(CuroboPlannerPolicy, OpenClosePlannerPolicy):
         self, obj, model, data, pickup_aabb_center: np.ndarray, pickup_aabb_size: np.ndarray
     ) -> Cuboid | None:
         """Return a cuboid for the single counter geom with the most XY overlap with the pickup object."""
-        all_geom_ids = descendant_geoms(model, obj.body_id, visual_only=False)
+        all_geom_ids = descendant_geoms(model, obj.body_id, visible_only=False)
         geom_ids = [
             g for g in all_geom_ids if model.geom_contype[g] != 0 or model.geom_conaffinity[g] != 0
         ]
@@ -641,7 +644,7 @@ class CuroboOpenClosePlannerPolicy(CuroboPlannerPolicy, OpenClosePlannerPolicy):
 
     def _create_cuboid_for_object(self, obj, model, data) -> Cuboid | None:
         try:
-            aabb_center, aabb_size = body_aabb(model, data, obj.body_id, visual_only=False)
+            aabb_center, aabb_size = body_aabb(model, data, obj.body_id, visible_only=False)
         except ValueError:
             log.debug(f"Skipping object {obj.name} (body_id={obj.body_id}) - no geoms found")
             return None

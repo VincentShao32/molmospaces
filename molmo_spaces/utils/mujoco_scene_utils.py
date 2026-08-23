@@ -1,5 +1,4 @@
 import logging
-from typing import NoReturn
 
 import mujoco
 import numpy as np
@@ -32,17 +31,6 @@ def add_visual_capsule(scene, point1, point2, radius, rgba) -> None:
     mujoco.mjv_connector(
         scene.geoms[scene.ngeom - 1], mujoco.mjtGeom.mjGEOM_CAPSULE, radius, point1, point2
     )
-
-
-def update_visual_robot(scene_model, scene_data, robot_xml_path, joint_positions=None) -> NoReturn:
-    """Updates the visual robot's configuration in the scene.
-
-    Args:
-        scene: mjvScene object
-        robot_model: MjModel of the robot
-        joint_positions (dict, optional): Dictionary of joint name to position values
-    """
-    raise NotImplementedError("Not implemented")
 
 
 def randomize_door_joints(  # TODO: do these defaults make sense?
@@ -183,6 +171,7 @@ def place_object_near(
         max_dist_to_reference: Maximum distance to the reference position
         supporting_geom_id: ID of the supporting geometry to optionally ensure the object is placed on top of
         z_eps: Epsilon to add to the z-offset to avoid collision
+
     Raises:
         ObjectPlacementError: If the object cannot be placed within the specified number of attempts
     """
@@ -287,10 +276,12 @@ def get_supporting_geom(
     """
     Finds the supporting geometry for an object, using a heuristic.
     Searches for a geom in contact with the object, such that the contact is in the bottom half of the object's AABB and the normal is pointing upwards.
+
     Args:
         data: MjData object
         object_id: Body ID of the root body to find the supporting geometry for
         angle_threshold: Threshold for the angle between the normal and the vertical axis to be considered parallel, in radians
+
     Returns:
         int: Geom ID of the supporting geometry, or None if no supporting geometry is found
     """
@@ -298,10 +289,10 @@ def get_supporting_geom(
     assert model.body_rootid[object_id] == object_id, "Object is not a root body"
 
     try:
-        body_aabb_center, _ = body_aabb(model, data, object_id, visual_only=True)
+        body_aabb_center, _ = body_aabb(model, data, object_id, visible_only=True)
     except ValueError:
-        # fallback if body doesn't have any visual geoms (usually not the case)
-        body_aabb_center, _ = body_aabb(model, data, object_id, visual_only=False)
+        # fallback if body doesn't have any visible geoms (usually not the case)
+        body_aabb_center, _ = body_aabb(model, data, object_id, visible_only=False)
     cos_threshold = np.cos(angle_threshold)
 
     for c in data.contact:
@@ -327,6 +318,7 @@ def is_object_supported_by_body(
     """
     Checks if an object is supported by a given body, using heuristics.
     This is more precise than get_supporting_geom.
+
     Args:
         data: MjData object
         object_id: Body ID of the root body to check if it is supported by the supporting body
@@ -334,6 +326,7 @@ def is_object_supported_by_body(
         angle_threshold: Threshold for the angle between the normal and the vertical axis to be considered parallel, in radians
         frac_weight_threshold: The upward component of the contact force must be at least this fraction of the object weight to be considered supported
         eps: Threshold for the net contact force to be considered non-zero
+
     Returns:
         bool: True if the object is supported by the given support, False otherwise
     """

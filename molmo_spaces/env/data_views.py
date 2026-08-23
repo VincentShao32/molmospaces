@@ -7,6 +7,7 @@ import mujoco
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
+from molmo_spaces.utils.linalg_utils import inverse_homogeneous_matrix
 from molmo_spaces.utils.pose import pos_quat_to_pose_mat, pose_mat_to_pos_quat
 
 
@@ -144,7 +145,38 @@ class MlSpacesCamera(MlSpacesObjectAbstract):
 
     @cached_property
     def camera_id(self) -> int:
-        return int(self.mj_data.cameraid[self.name].id)
+        return int(self.mj_data.camera(self.name).id)
+
+    def get_focal_length(self, height: int, width: int) -> float:
+        """Focal length in pixels"""
+        return height / (2 * np.tan(np.radians(self.fovy) / 2))
+
+    def get_fovx(self, height: int, width: int) -> float:
+        """Horizontal field of view in degrees"""
+        return np.degrees(2 * np.arctan(width / (2 * self.get_focal_length(height, width))))
+
+    def get_fovy(self, height: int, width: int) -> float:
+        """Vertical field of view in degrees"""
+        return self.fovy
+
+    def get_intrinsic_matrix(self, height: int, width: int) -> np.ndarray:
+        """
+        3x3 intrinsic matrix, see: https://en.wikipedia.org/wiki/Camera_resectioning#Intrinsic_parameters
+        """
+        f = self.get_focal_length(height, width)
+        return np.array(
+            [
+                [f, 0, width / 2],
+                [0, f, height / 2],
+                [0, 0, 1],
+            ]
+        )
+
+    def get_camera_matrix(self, height: int, width: int) -> np.ndarray:
+        """
+        3x4 camera matrix, see: https://en.wikipedia.org/wiki/Camera_resectioning#Projection
+        """
+        return self.get_intrinsic_matrix(height, width) @ inverse_homogeneous_matrix(self.pose)[:3]
 
     @property
     def fovy(self) -> float:
@@ -646,6 +678,7 @@ class Door(MlSpacesArticulationObject):
 
     def get_hinge_joint_index(self) -> int:
         """Get the index of the door hinge joint (the joint that does not have 'handle' in its name).
+
         Returns:
             int: Index of the hinge joint in self.joint_ids list (not the joint ID itself)
         Warns:
@@ -662,6 +695,7 @@ class Door(MlSpacesArticulationObject):
 
     def get_handle_joint_index(self) -> int:
         """Get the index of the handle joint (the joint that has 'handle' in its name).
+
         Returns:
             int: Index of the handle joint in self.joint_ids list
         """
@@ -676,6 +710,7 @@ class Door(MlSpacesArticulationObject):
 
     def _get_handle_leaf_body_ids(self) -> list[int]:
         """Get leaf body IDs in door hierarchy (assumed to be handles).
+
         Returns:
             list[int]: List of leaf body IDs (excluding the root door body)
         """
@@ -695,6 +730,7 @@ class Door(MlSpacesArticulationObject):
         """Get handle bounding boxes as an array.
         Finds leaf bodies in the door hierarchy (assumed to be handles) and
         returns their visual geom AABBs.
+
         Returns:
             np.ndarray: Array of AABBs (center, size) for handle visual geoms
         """
@@ -716,6 +752,7 @@ class Door(MlSpacesArticulationObject):
         """Get handle pose (position + quaternion) as a single array.
         Finds the first handle visual geom and returns its pose.
         If multiple handles exist, returns the first one.
+
         Returns:
             np.ndarray: Handle pose [x, y, z, qw, qx, qy, qz]
         """

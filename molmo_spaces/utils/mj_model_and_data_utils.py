@@ -43,13 +43,14 @@ def descendant_bodies(model: MjModel, body_id: int):
     return descendants
 
 
-def descendant_geoms(model: MjModel, body_id: int, visual_only: bool = True) -> list[int]:
+def descendant_geoms(model: MjModel, body_id: int, visible_only: bool = True) -> list[int]:
     """
     Get all geoms attached to descendants of a body in a MuJoCo model.
 
     Args:
         model (MjModel): The MuJoCo model to use.
         body_id (int): The id of the body to get the geoms of.
+        visible_only (bool): Whether to only include visible geoms (groups 0-2).
 
     Returns:
         list[int]: A sorted list of the ids of the geoms attached to descendants of the body, or the body itself.
@@ -57,30 +58,31 @@ def descendant_geoms(model: MjModel, body_id: int, visual_only: bool = True) -> 
     bodies = np.array(list(descendant_bodies(model, body_id)))
     mask = np.any(model.geom_bodyid.reshape(1, -1) == bodies.reshape(-1, 1), axis=0)
     geoms = np.where(mask)[0]
-    if visual_only:
-        contype = model.geom_contype[geoms]
-        conaffinity = model.geom_conaffinity[geoms]
-        is_visual = (contype == 0) & (conaffinity == 0)
-        geoms = geoms[is_visual]
+    if visible_only:
+        is_visible = model.geom_group[geoms] < 3
+        geoms = geoms[is_visible]
     return geoms.tolist()
 
 
 def body_aabb(
-    model: mujoco.MjModel, data: mujoco.MjData, body_id: int, visual_only: bool = True
+    model: mujoco.MjModel, data: mujoco.MjData, body_id: int, visible_only: bool = True
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Computes the axis-aligned bounding box (AABB) for a body in a MuJoCo model.
+
     Args:
         model (mujoco.MjModel): The MuJoCo model containing the body.
         data (mujoco.MjData): The MuJoCo data containing the state of the model.
         body_id (int): The id of the body to compute the AABB for.
-        visual_only (bool): Whether to only include visual geoms. This can help make the AABB fit tighter.
+        visible_only (bool): Whether to only include visible geoms (groups 0-2).
+            This can help make the AABB fit tighter.
+
     Returns:
         tuple: A tuple containing:
             - numpy.ndarray: The center of the AABB in world space.
             - numpy.ndarray: The x,y,z dimensions of the AABB.
     """
-    geoms = descendant_geoms(model, body_id, visual_only=visual_only)
+    geoms = descendant_geoms(model, body_id, visible_only=visible_only)
     if not geoms:
         # If body has no geoms, return body position as center with zero extent
         return data.xpos[body_id].copy(), np.zeros(3)
@@ -92,10 +94,12 @@ def mesh_aabb(
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Compute the tight AABB in world space for a mesh geom using its vertices.
+
     Args:
         model (mujoco.MjModel): The MuJoCo model containing the geom.
         data (mujoco.MjData): The MuJoCo data containing the state of the model.
         geom_id (int): The id of the mesh geom to compute the AABB for. Must be a mesh geom.
+
     Returns:
         tuple: A tuple containing:
             - numpy.ndarray: The center of the AABB in world space.
@@ -123,12 +127,14 @@ def geom_aabb(
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Computes the axis-aligned bounding box (AABB) for a list of geometries in a MuJoCo model.
+
     Args:
         model (mujoco.MjModel): The MuJoCo model containing the geometries.
         data (mujoco.MjData): The MuJoCo data containing the state of the model.
         geom_ids (list[int]): A list of geometry IDs for which to compute the AABB.
         tight_mesh (bool): Whether to compute the tight AABB for mesh geoms.
             If False, the AABB will be computed using the geom_aabb field, and may not be tight in world space.
+
     Returns:
         tuple: A tuple containing:
             - numpy.ndarray: The center of the merged AABB in world space.
@@ -174,16 +180,21 @@ def site_pose(data: mujoco.MjData, site_id: int) -> np.ndarray:
     return trf
 
 
-def body_base_pos(data: mujoco.MjData, body_id: int, visual_only: bool = True) -> np.ndarray:
+def body_base_pos(data: mujoco.MjData, body_id: int, visible_only: bool = True) -> np.ndarray:
     """
     Returns the base position of a body in the world frame.
     In XY, this is the center of the AABB, and in Z, this is the bottom of the AABB.
+
     Args:
         data: MjData object
         body_id: ID of the body to get the base position of.
-        visual_only (bool): Whether to only include visual geoms. This can help make the AABB fit tighter.
+        visible_only (bool): Whether to only include visible geoms (groups 0-2).
+            This can help make the AABB fit tighter.
+
     Returns:
         np.ndarray: The base position of the body in the world frame, of shape (3,).
     """
-    body_aabb_center, body_aabb_size = body_aabb(data.model, data, body_id, visual_only=visual_only)
+    body_aabb_center, body_aabb_size = body_aabb(
+        data.model, data, body_id, visible_only=visible_only
+    )
     return body_aabb_center - np.array([0, 0, body_aabb_size[2] / 2])

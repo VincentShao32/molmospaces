@@ -5,29 +5,18 @@ from mujoco import MjData, MjModel
 from scipy.spatial.transform import Rotation as R
 
 from molmo_spaces.kinematics.mujoco_kinematics import MlSpacesKinematics
-from molmo_spaces.molmo_spaces_constants import get_robot_paths
-from molmo_spaces.robots.robot_views.abstract import RobotViewFactory
-from molmo_spaces.robots.robot_views.rum_gripper_view import FloatingRUMRobotView
 
 
 class FloatingRUMKinematics(MlSpacesKinematics):
-    def __init__(
-        self,
-        model: MjModel,
-        data: MjData | None = None,
-        namespace: str = "",
-        robot_view_factory: RobotViewFactory = FloatingRUMRobotView,
-    ):
-        if data is None:
-            data = MjData(model)
-        robot_view = robot_view_factory(data, namespace)
-        super().__init__(data, robot_view)
+    """
+    Kinematics solver that provides a specialized implementation for the Floating RUM robot.
+    """
 
     def ik(
         self,
         move_group_id: str,
         pose: np.ndarray,
-        unlocked_move_group_ids: list[str],
+        unlocked_move_group_ids: list[str] | None,
         q0: dict[str, np.ndarray],
         base_pose: np.ndarray,
         rel_to_base: bool = False,
@@ -41,6 +30,10 @@ class FloatingRUMKinematics(MlSpacesKinematics):
             pose = pose @ np.linalg.inv(ee_to_base)
         else:
             assert move_group_id == "base"
+
+        if unlocked_move_group_ids is None:
+            unlocked_move_group_ids = self._robot_view.move_group_ids()
+
         if "base" not in unlocked_move_group_ids:
             return None
 
@@ -54,10 +47,14 @@ class FloatingRUMKinematics(MlSpacesKinematics):
 
 
 if __name__ == "__main__":
+    import time
+
     import mujoco
     import numpy as np
-    from mujoco.viewer import Handle
+    from mujoco.viewer import Handle, launch_passive
 
+    from molmo_spaces.configs.robot_configs import FloatingRUMRobotConfig
+    from molmo_spaces.robots.robot_views.rum_gripper_view import FloatingRUMRobotView
     from molmo_spaces.utils.pose import pos_quat_to_pose_mat
 
     def _show_poses(viewer: Handle, poses: np.ndarray, color=(1, 0, 0, 1)) -> None:
@@ -99,26 +96,18 @@ if __name__ == "__main__":
         viewer.user_scn.ngeom = ngeom + i
 
     def main():
-        import time
-
-        import mujoco
-        import numpy as np
-        from mujoco.viewer import launch_passive
-
         np.set_printoptions(linewidth=np.inf)
 
-        xml_path = str(get_robot_paths().get("floating_rum")) + "/model.xml"
-        model = MjModel.from_xml_path(xml_path)
-        robot_view_factory = FloatingRUMRobotView
+        robot_config = FloatingRUMRobotConfig()
+        xml_path = robot_config.get_robot_xml_path()
+        model = MjModel.from_xml_path(str(xml_path))
 
         data = MjData(model)
         mujoco.mj_forward(model, data)
 
         ns = ""
-        robot_view = robot_view_factory(data, ns)
-        kinematics = FloatingRUMKinematics(
-            model, namespace=ns, robot_view_factory=robot_view_factory
-        )
+        robot_view = FloatingRUMRobotView(data, ns)
+        kinematics = FloatingRUMKinematics(robot_config)
 
         pose0 = np.array(
             [

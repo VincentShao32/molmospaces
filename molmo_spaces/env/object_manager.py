@@ -29,8 +29,8 @@ from molmo_spaces.utils.object_metadata import ObjectMeta, clip_sim, compute_tex
 from molmo_spaces.utils.synset_utils import (
     filter_synsets_to_remove_hyponyms,
     generate_all_hypernyms_with_exclusions,
+    get_wordnet,
     is_hypernym_of,
-    wn,
 )
 
 if TYPE_CHECKING:
@@ -437,7 +437,7 @@ class ObjectManager:
         res = []
         seen_versions = set()
 
-        for lemma in wn.synset(synset).lemma_names():
+        for lemma in get_wordnet().synset(synset).lemma_names():
             space = normalize_expression(lemma).strip()
             # lower = space.replace(" ", "")
             # snake = space.replace(" ", "_")
@@ -648,6 +648,10 @@ class ObjectManager:
 
         return cache_in_use[oname]["structural"]
 
+    def _has_visible_geom(self, body_id: int) -> bool:
+        geom_ids = descendant_geoms(self.model, body_id, visible_only=True)
+        return len(geom_ids) > 0
+
     def is_excluded(self, object_or_name_or_id: ObjectOrNameOrIdType) -> bool:
         cache_in_use = self._model_cache
 
@@ -656,9 +660,7 @@ class ObjectManager:
         if "excluded" not in cache_in_use[oname]:
             is_excluded = (
                 self._env.config.robot_config.robot_namespace in oname
-            ) or not descendant_geoms(
-                self.model, self.get_object(object_or_name_or_id).body_id, True
-            )
+            ) or not self._has_visible_geom(self.get_object_body_id(object_or_name_or_id))
             if self._caching_enabled:
                 cache_in_use[oname]["excluded"] = is_excluded
             else:
@@ -795,7 +797,7 @@ class ObjectManager:
             List of door body names found in the scene.
         """
         door_body_names = []
-        for key, value in self.scene_metadata["objects"].items():
+        for key, value in (self.scene_metadata or {}).get("objects", {}).items():
             if "doorway" in key:
                 name_map = value.get("name_map", {})
                 bodies = name_map.get("bodies", {})
@@ -1074,11 +1076,15 @@ class ObjectManager:
             try:
                 img.append(ObjectMeta.img_features(asset_id))
                 kept_asset_ids.append(asset_id)
-            except ValueError:
+            except KeyError:
                 log.warning(f"No image features for {asset_id}, ignoring.")
 
         if name_to_uid[target_name] not in kept_asset_ids:
-            raise ValueError(f"Missing asset id {name_to_uid[target_name]} from {target_name}")
+            log.warning(
+                f"Could not get image features for {target_name}, using dummy description scores."
+            )
+            names = self.get_natural_object_names(object_or_name_or_id, [])
+            return [(1.0, 1.0, name) for name in names]
 
         img = np.concatenate(img, axis=0)
         asset_ids = kept_asset_ids
@@ -1089,7 +1095,7 @@ class ObjectManager:
         )
         try:
             sim = clip_sim(img, compute_text_clip(descriptions))
-        except NameError:
+        except ImportError:
             log.warning("No CLIP module, using dummy description scores.")
             # e.g. when you don't want to install it / no gpu (?)
             names = self.get_natural_object_names(object_or_name_or_id, [])
@@ -1230,14 +1236,15 @@ class ObjectManager:
         """Return of list of all task relevant bodies i.e. not robots/policy objects"""
 
         task_objects = []
-        for object_name, object_dict in self.scene_metadata["objects"].items():
-            if not object_dict["is_static"]:
-                try:
-                    task_object = create_mlspaces_body(self.data, object_name)
-                except KeyError:
-                    log.warning("Could not find object %s in scene", object_name)
-                    continue
-                task_objects.append(task_object)
+        if self.scene_metadata is not None:
+            for object_name, object_dict in self.scene_metadata["objects"].items():
+                if not object_dict["is_static"]:
+                    try:
+                        task_object = create_mlspaces_body(self.data, object_name)
+                    except KeyError:
+                        log.warning("Could not find object %s in scene", object_name)
+                        continue
+                    task_objects.append(task_object)
 
         # TODO(Abhay): do we want this?
         for object_name in self._env.config.task_config.added_objects:
@@ -1463,6 +1470,7 @@ class ObjectManager:
 
     def get_door_bboxes_array(self, object_or_name_or_id: ObjectOrNameOrIdType) -> np.ndarray:
         """Get door collision geometry bounding boxes as an array.
+
         Returns:
             np.ndarray: Array of AABBs (center, size) for door collision geoms
         """
@@ -1538,6 +1546,8 @@ class ObjectManager:
         contactless_object_names = set()
         seen_poly_z = set()
 
+        meta_objs = (self.scene_metadata or {}).get("objects", {})
+
         # Fallback: list with objects with aabbs overlapping >= 50% in xy with the bench and "just above" in z
         for geom_id in bench_geom_ids:
             # Take full body
@@ -1572,7 +1582,7 @@ class ObjectManager:
 
                 if object_name in object_names:
                     continue
-                if object_name not in self.scene_metadata.get("objects", {}):
+                if object_name not in meta_objs:
                     continue
                 if object_name in contactless_object_names:
                     continue
@@ -1614,9 +1624,9 @@ class ObjectManager:
     def get_body_to_geoms(self):
         body_to_geom_ids = defaultdict(set)
         for geom_id in range(0, self.model.ngeom):
-            body_id = self.model.geom(geom_id).bodyid
-            root_id = self.model.body(body_id).rootid
-            body_to_geom_ids[int(root_id)].add(int(geom_id))
+            body_id = int(self.model.geom(geom_id).bodyid.item())
+            root_id = int(self.model.body(body_id).rootid.item())
+            body_to_geom_ids[root_id].add(geom_id)
         return {
             key: sorted(values)
             for key, values in body_to_geom_ids.items()

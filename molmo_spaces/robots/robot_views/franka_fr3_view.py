@@ -7,17 +7,17 @@ Each component is implemented as a MoveGroup, with the overall robot structure
 managed by the FrankaFR3RobotView class.
 """
 
-import mujoco
 import numpy as np
 from mujoco import MjData
 
 from molmo_spaces.robots.robot_views.abstract import (
     GripperGroup,
+    MJCFFrameMixin,
     MocapRobotBaseGroup,
-    MoveGroup,
     RobotView,
+    SimplyActuatedMoveGroup,
 )
-from molmo_spaces.utils.mj_model_and_data_utils import body_pose, site_pose
+from molmo_spaces.utils.mj_model_and_data_utils import body_pose
 
 
 class FrankaFR3BaseGroup(MocapRobotBaseGroup):
@@ -27,7 +27,7 @@ class FrankaFR3BaseGroup(MocapRobotBaseGroup):
         super().__init__(mj_data, body_id)
 
 
-class FrankaFR3ArmGroup(MoveGroup):
+class FrankaFR3ArmGroup(MJCFFrameMixin, SimplyActuatedMoveGroup):
     def __init__(
         self,
         mj_data: MjData,
@@ -44,24 +44,19 @@ class FrankaFR3ArmGroup(MoveGroup):
         super().__init__(mj_data, joint_ids, act_ids, self._arm_root_id, base_group)
 
     @property
-    def noop_ctrl(self) -> np.ndarray:
-        return self.joint_pos.copy()
+    def leaf_frame_id(self) -> int:
+        return self._ee_site_id
 
     @property
-    def leaf_frame_to_world(self) -> np.ndarray:
-        return site_pose(self.mj_data, self._ee_site_id)
+    def leaf_frame_type(self):
+        return "site"
 
     @property
     def root_frame_to_world(self) -> np.ndarray:
         return body_pose(self.mj_data, self._arm_root_id)
 
-    def get_jacobian(self) -> np.ndarray:
-        J = np.zeros((6, self.mj_model.nv))
-        mujoco.mj_jacSite(self.mj_model, self.mj_data, J[:3], J[3:], self._ee_site_id)
-        return J
 
-
-class FrankaFR3GripperGroup(GripperGroup):
+class FrankaFR3GripperGroup(MJCFFrameMixin, GripperGroup):
     def __init__(
         self, mj_data: MjData, base_group: FrankaFR3BaseGroup, namespace: str = ""
     ) -> None:
@@ -76,6 +71,14 @@ class FrankaFR3GripperGroup(GripperGroup):
         super().__init__(mj_data, joint_ids, act_ids, root_body_id, base_group)
         self._ee_site_id = model.site(f"{namespace}grasp_site").id
 
+    @property
+    def leaf_frame_id(self) -> int:
+        return self._ee_site_id
+
+    @property
+    def leaf_frame_type(self):
+        return "site"
+
     def set_gripper_ctrl_open(self, open: bool) -> None:
         self.ctrl = [255 if open else 0]
 
@@ -88,17 +91,8 @@ class FrankaFR3GripperGroup(GripperGroup):
         return np.sum(self.joint_pos).item()
 
     @property
-    def leaf_frame_to_world(self) -> np.ndarray:
-        return site_pose(self.mj_data, self._ee_site_id)
-
-    @property
     def root_frame_to_world(self) -> np.ndarray:
         return self.leaf_frame_to_world
-
-    def get_jacobian(self) -> np.ndarray:
-        J = np.zeros((6, self.mj_model.nv))
-        mujoco.mj_jacSite(self.mj_model, self.mj_data, J[:3], J[3:], self._ee_site_id)
-        return J
 
 
 class FrankaFR3RobotView(RobotView):

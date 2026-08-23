@@ -33,7 +33,7 @@ def generate_test_data_for_rby1():
     from molmo_spaces.data_generation.config.door_opening_configs import DoorOpeningDataGenConfig
 
     config = DoorOpeningDataGenConfig()
-    config.seed = 0
+    config.seed = 4734
     config.task_horizon = 6
     config.use_passive_viewer = False
     config.profile = True
@@ -77,8 +77,8 @@ def generate_test_data_for_rby1():
     # Run policy and capture observations after steps
     print("\n=== Running policy and capturing observations after steps ===")
     policy_config = config.policy_config
-    policy_cls = policy_config.policy_cls
-    policy = policy_cls(config, task)
+    policy_factory = policy_config.policy_factory
+    policy = policy_factory(config, task)
     policy.reset()
 
     # Run policy for 10 steps using shared utility and capture observations

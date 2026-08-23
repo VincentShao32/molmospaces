@@ -29,9 +29,8 @@ class OpeningTask(PickTask):
         self,
         env: BaseMujocoEnv,
         exp_config: MlSpacesExpConfig,
-        sensor_suite: SensorSuite | None = None,
     ) -> None:
-        super().__init__(env, exp_config, sensor_suite)
+        super().__init__(env, exp_config)
         self.exp_config = exp_config
 
         self.articulation_objects = self._get_articulation_objects()
@@ -64,13 +63,6 @@ class OpeningTask(PickTask):
                     articulation_objects.append([articulation_object])
 
         return articulation_objects
-
-    def _create_sensor_suite_from_config(self, config: MlSpacesExpConfig) -> SensorSuite:
-        """Create a sensor suite from configuration using the centralized get_core_sensors function."""
-        from molmo_spaces.env.sensors import get_core_sensors
-
-        sensors = get_core_sensors(config)
-        return SensorSuite(sensors)
 
     def judge_success(self) -> bool:
         success = self.get_reward()[0] >= self.config.task_config.task_success_threshold
@@ -162,13 +154,8 @@ class DoorOpeningTask(BaseMujocoTask):
         self,
         env: BaseMujocoEnv,
         exp_config: MlSpacesExpConfig,
-        sensor_suite: SensorSuite | None = None,
     ) -> None:
-        # Create sensor suite if not provided and sensors are enabled
-        if sensor_suite is None and exp_config.task_config.use_sensors:
-            sensor_suite = self._create_sensor_suite_from_config(exp_config)
-
-        super().__init__(env, exp_config, sensor_suite)
+        super().__init__(env, exp_config)
         self.exp_config = exp_config
 
         # Get door object in the environment
@@ -445,10 +432,12 @@ class DoorOpeningTask(BaseMujocoTask):
         return_both_poses: bool = False,
     ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
         """Get the target ee pose for grasping or articulating the door handle.
+
         Args:
             offset_distance: The distance to offset the grasp position from the door handle position, Eg. for pre-grasping the handle.
             articulate_deltas: The deltas to articulate the door joints. If None, don't articulate the door joints.
             return_both_poses: If True, returns both symmetric poses (original and 180-degree flipped). If False, returns only the original pose.
+
         Returns:
             The target ee pose for grasping or articulating the door handle.
             If return_both_poses=True, returns a tuple of (original_pose, flipped_pose).
@@ -514,7 +503,7 @@ class DoorOpeningTask(BaseMujocoTask):
             target_ee_rot_flipped = target_ee_rot * flip_rotation
             target_ee_quat_flipped = target_ee_rot_flipped.as_quat(scalar_first=True)
             target_ee_pose_flipped = np.concatenate([target_ee_pos, target_ee_quat_flipped])
-            if self.exp_config.task_config.viz_target_ee:
+            if self.exp_config.task_config.viz_target_ee and self.env.current_model.nmocap > 0:
                 self.env.mj_datas[0].mocap_pos[0] = target_ee_pose[:3]
                 self.env.mj_datas[0].mocap_quat[0] = target_ee_pose[3:]
             return target_ee_pose, target_ee_pose_flipped
@@ -530,7 +519,7 @@ class DoorOpeningTask(BaseMujocoTask):
             )
 
         # Optional: Visualize target ee pose
-        if self.exp_config.task_config.viz_target_ee:
+        if self.exp_config.task_config.viz_target_ee and self.env.current_model.nmocap > 0:
             self.env.mj_datas[0].mocap_pos[0] = target_ee_pose[:3]
             self.env.mj_datas[0].mocap_quat[0] = target_ee_pose[3:]
         return target_ee_pose

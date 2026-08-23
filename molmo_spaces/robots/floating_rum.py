@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from mujoco import MjData, MjSpec, mjtEq, mjtObj
 
+from molmo_spaces.env.sensors import TCPPoseSensor
 from molmo_spaces.kinematics.floating_rum_kinematics import FloatingRUMKinematics
 from molmo_spaces.kinematics.parallel.dummy_parallel_kinematics import DummyParallelKinematics
 from molmo_spaces.robots.abstract import Robot
@@ -25,16 +26,10 @@ class FloatingRUMRobot(Robot):
         self._robot_view = config.robot_config.robot_view_factory(
             mj_data, config.robot_config.robot_namespace
         )
-        self._kinematics = FloatingRUMKinematics(
-            self.mj_model,
-            namespace=config.robot_config.robot_namespace,
-            robot_view_factory=config.robot_config.robot_view_factory,
-        )
+        self._kinematics = FloatingRUMKinematics(config.robot_config)
         self._parallel_kinematics = DummyParallelKinematics(
             config.robot_config,
             self._kinematics,
-            "gripper",
-            ["base"],
         )
         self._last_cmd_action: dict[str, np.ndarray] | None = None
 
@@ -58,12 +53,10 @@ class FloatingRUMRobot(Robot):
     def controllers(self):
         return {}
 
-    @property
-    def state_dim(self):
-        return 7
-
-    def action_dim(self, move_group_ids: list[str]):
-        return sum(self._robot_view.get_move_group(mg_id).n_actuators for mg_id in move_group_ids)
+    def create_robot_sensors(self):
+        return super().create_robot_sensors() + [
+            TCPPoseSensor(uuid="tcp_pose"),
+        ]
 
     def update_control(self, action_command_dict: dict[str, Any]):
         action_command_dict = self._apply_action_noise_and_save_unnoised_cmd_jp(action_command_dict)
@@ -74,13 +67,6 @@ class FloatingRUMRobot(Robot):
         for mg_id, ctrl in self._last_cmd_action.items():
             if ctrl is not None:
                 self._robot_view.get_move_group(mg_id).ctrl = ctrl
-
-    def set_joint_pos(self, robot_joint_pos_dict):
-        for mg_id, joint_pos in robot_joint_pos_dict.items():
-            self._robot_view.get_move_group(mg_id).joint_pos = joint_pos
-
-    def set_world_pose(self, robot_world_pose):
-        self._robot_view.base.pose = robot_world_pose
 
     def reset(self):
         self._last_cmd_action = None
@@ -97,15 +83,21 @@ class FloatingRUMRobot(Robot):
         cls,
         robot_config: "BaseRobotConfig",
         spec: MjSpec,
-        robot_spec: MjSpec,
         prefix: str,
         pos: list[float],
         quat: list[float],
         randomize_textures: bool = False,
+        strip_meshes: bool = False,
     ) -> None:
         pos = pos + [0.0] if len(pos) == 2 else pos
         super().add_robot_to_scene(
-            robot_config, spec, robot_spec, prefix, pos, quat, randomize_textures
+            robot_config=robot_config,
+            spec=spec,
+            prefix=prefix,
+            pos=pos,
+            quat=quat,
+            randomize_textures=randomize_textures,
+            strip_meshes=strip_meshes,
         )
 
         # add target pose body and weld to base

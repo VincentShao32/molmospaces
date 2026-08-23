@@ -32,8 +32,8 @@ from molmo_spaces.env.env import BaseMujocoEnv, CPUMujocoEnv
 from molmo_spaces.molmo_spaces_constants import (
     ABS_PATH_OF_TOP_LEVEL_MOLMO_SPACES_DIR,
     DATA_TYPE_TO_SOURCE_TO_VERSION,
-    get_robot_path,
     get_scenes,
+    get_scenes_root,
 )
 
 MJC_VERSION = tuple(map(int, mujoco.__version__.split(".")))
@@ -200,7 +200,6 @@ def extract_asset_uid_from_object_name(object_name: str) -> str | None:
 
 
 from molmo_spaces.robots.abstract import Robot
-from molmo_spaces.tasks.scene_xml_utils import xml_add_rby1_to_scene
 from molmo_spaces.tasks.task import BaseMujocoTask
 from molmo_spaces.tasks.task_sampler_errors import HouseInvalidForTask
 from molmo_spaces.utils.lazy_loading_utils import install_scene_with_objects_and_grasps_from_path
@@ -288,8 +287,8 @@ class BaseMujocoTaskSampler:
 
         self._house_inds = exp_config.task_sampler_config.house_inds
         if self._house_inds is None or self._house_inds == []:
-            mapping = get_scenes(exp_config.scene_dataset, exp_config.data_split)
-            self._house_inds = list(
+            mapping = self._get_dataset_index_map()
+            self._house_inds = sorted(
                 [k for k, v in mapping[exp_config.data_split].items() if v is not None]
             )
 
@@ -549,15 +548,7 @@ class BaseMujocoTaskSampler:
         if self._datagen_profiler is not None:
             self._datagen_profiler.start("compile_xml_load")
 
-        robot_file_path = get_robot_path(robot_config.name) / robot_config.robot_xml_path
-        use_include = robot_config.name == "rby1" or robot_config.name == "rby1m"
-
-        if use_include:
-            spec = xml_add_rby1_to_scene(
-                self.config.task_sampler_config, scene_file_path, robot_file_path
-            )
-        else:
-            spec = MjSpec.from_file(str(scene_file_path))
+        spec = MjSpec.from_file(str(scene_file_path))
 
         # Hack(wilbert): only run on 3.5.1 onwards for now (custom mujoco wheel)
         if MJC_VERSION >= (3, 5, 1):
@@ -593,20 +584,18 @@ class BaseMujocoTaskSampler:
         if self._datagen_profiler is not None:
             self._datagen_profiler.start("compile_robot_add")
 
-        if not use_include:
-            # Add the robot using a default position
-            self.config.robot_config.robot_cls.add_robot_to_scene(
-                self.config.robot_config,
-                spec,
-                MjSpec.from_file(str(robot_file_path)),
-                prefix="robot_0/",
-                pos=[0, -0.15],  # TOOD(abhay): is this ok?
-                quat=[1, 0, 0, 1],
-                randomize_textures=self.config.task_sampler_config.randomize_robot_textures,
-            )
+        # Add the robot using a default position
+        robot_config.robot_cls.add_robot_to_scene(
+            robot_config,
+            spec,
+            prefix="robot_0/",
+            pos=[0.0, 0.0],
+            quat=[1.0, 0.0, 0.0, 0.0],
+            randomize_textures=self.config.task_sampler_config.randomize_robot_textures,
+        )
 
         # apply robot control overrides
-        self.config.robot_config.robot_cls.apply_control_overrides(spec, self.config.robot_config)
+        robot_config.robot_cls.apply_control_overrides(spec, robot_config)
 
         if self._datagen_profiler is not None:
             self._datagen_profiler.end("compile_robot_add")
@@ -707,7 +696,7 @@ class BaseMujocoTaskSampler:
 
         return setup_empty_materials(spec, num_materials)
 
-    def update_scene(self, scene_path: str | None = None, variant: str = "base") -> None:
+    def update_scene(self, scene_path: str | None = None) -> None:
         """Update the environment's scene by loading a new scene model.
 
         Args:
@@ -715,34 +704,38 @@ class BaseMujocoTaskSampler:
             variant: The scene variant to use when scene_path is None (ceiling", "map", "base", etc.)
         """
         if scene_path is None:
-            scene_path = self._current_house_scene_path(variant=variant)
+            scene_path = self._current_house_scene_path()
 
-        # Track asset installation time (fetching/extracting scene, objects, grasps)
-        # Use detailed profiling to identify which asset type is slow
-        if self._datagen_profiler is not None:
-            self._datagen_profiler.start("scene_asset_install")
-            from molmo_spaces.utils.lazy_loading_utils import (
-                install_grasps_for_scene,
-                install_objects_for_scene,
-                install_scene_from_path,
-            )
+        # If using a MolmoSpaces scene, install it
+        if get_scenes_root().resolve() in Path(scene_path).resolve().parents:
+            # Track asset installation time (fetching/extracting scene, objects, grasps)
+            # Use detailed profiling to identify which asset type is slow
+            if self._datagen_profiler is not None:
+                self._datagen_profiler.start("scene_asset_install")
+                from molmo_spaces.utils.lazy_loading_utils import (
+                    install_grasps_for_scene,
+                    install_objects_for_scene,
+                    install_scene_from_path,
+                )
 
-            self._datagen_profiler.start("asset_install_scene")
-            install_scene_from_path(scene_path)
-            self._datagen_profiler.end("asset_install_scene")
+                self._datagen_profiler.start("asset_install_scene")
+                install_scene_from_path(scene_path)
+                self._datagen_profiler.end("asset_install_scene")
 
-            self._datagen_profiler.start("asset_install_objects")
-            install_objects_for_scene(scene_path, exclude_thor=True)
-            self._datagen_profiler.end("asset_install_objects")
+                self._datagen_profiler.start("asset_install_objects")
+                install_objects_for_scene(scene_path, exclude_thor=True)
+                self._datagen_profiler.end("asset_install_objects")
 
-            self._datagen_profiler.start("asset_install_grasps")
-            for grasp_source in ("droid_objaverse",):
-                install_grasps_for_scene(scene_path, grasp_source=grasp_source, exclude_thor=True)
-            self._datagen_profiler.end("asset_install_grasps")
+                self._datagen_profiler.start("asset_install_grasps")
+                for grasp_source in ("droid_objaverse",):
+                    install_grasps_for_scene(
+                        scene_path, grasp_source=grasp_source, exclude_thor=True
+                    )
+                self._datagen_profiler.end("asset_install_grasps")
 
-            self._datagen_profiler.end("scene_asset_install")
-        else:
-            install_scene_with_objects_and_grasps_from_path(scene_path)
+                self._datagen_profiler.end("scene_asset_install")
+            else:
+                install_scene_with_objects_and_grasps_from_path(scene_path)
 
         # Track scene compilation time (XML processing + MuJoCo spec.compile())
         if self._datagen_profiler is not None:
@@ -787,7 +780,6 @@ class BaseMujocoTaskSampler:
             robot_factory=self._create_robot,
             mj_model=model,
             mj_base_scene_path=scene_path,
-            use_filament=self.config.use_filament,
         )
         if self._datagen_profiler is not None:
             self._datagen_profiler.end("scene_env_create")
@@ -882,23 +874,24 @@ class BaseMujocoTaskSampler:
                 inertia_perturbation_ratio=0.2,
             )
 
-    # Dataset utilities (optional)
-    def _get_dataset_index_map(self) -> dict | None:
+    def _get_dataset_index_map(self) -> dict:
         if self._dataset_index_map is not None:
             return self._dataset_index_map
         name = self.config.scene_dataset
-        if not name:
-            return None
 
-        if isinstance(name, str) and not os.path.isabs(name):
+        if name != "user":
             mapping = get_scenes(name, self.config.data_split)
+            assert isinstance(mapping, dict)
         else:
-            current_idx = self._house_inds[0] if self._house_inds else 0
-            # Create new format with variant structure, defaulting to "base"
             mapping = {
-                "train": {current_idx: {"ceiling": None, "map": None, "base": name}},
-                "val": {current_idx: {"ceiling": None, "map": None, "base": name}},
+                self.config.data_split: {
+                    i: {"base": scene_xml_path}
+                    for i, scene_xml_path in enumerate(
+                        self.config.task_sampler_config.scene_xml_paths
+                    )
+                }
             }
+
         self._dataset_index_map = mapping
 
         return mapping
@@ -932,7 +925,7 @@ class BaseMujocoTaskSampler:
                 )
                 self._samples_per_current_house = 1
 
-    def _current_house_scene_path(self, variant: str = "base") -> str | None:
+    def _current_house_scene_path(self) -> str | None:
         """Get the scene path for the current house index and specified variant.
 
         Args:
@@ -946,6 +939,7 @@ class BaseMujocoTaskSampler:
         split_map = mapping[self.config.data_split]
         idx = self.current_house_index
         house_variants = split_map.get(idx, None)
+        variant = self.config.task_sampler_config.house_variant
 
         if house_variants is None:
             raise RuntimeError(f"No scene file for split '{self.config.data_split}' index {idx}")
@@ -1024,7 +1018,6 @@ class BaseMujocoTaskSampler:
         self,
         force_advance_scene=False,
         house_index=None,
-        variant: str = "ceiling",
     ) -> None | BaseMujocoTask:
         """Returns a task with batch size task_batch_size.
 
@@ -1049,7 +1042,7 @@ class BaseMujocoTaskSampler:
         )
         assert house_index is None or self.current_house_index == house_index
 
-        scene_path = self._current_house_scene_path(variant=variant)
+        scene_path = self._current_house_scene_path()
 
         need_load = (
             self._env is None
@@ -1073,7 +1066,7 @@ class BaseMujocoTaskSampler:
             if self._datagen_profiler is not None:
                 self._datagen_profiler.start("scene_load")
             try:
-                self.update_scene(scene_path=scene_path, variant=variant)
+                self.update_scene(scene_path=scene_path)
             finally:
                 if self._datagen_profiler is not None:
                     self._datagen_profiler.end("scene_load")

@@ -14,7 +14,6 @@ TODO: Future test improvements
 import datetime
 from pathlib import Path
 
-import jax
 import numpy as np
 import pytest
 
@@ -48,15 +47,13 @@ TEST_OUTPUT_DIR = Path(__file__).resolve().parent / "test_output"
 DEBUG_IMAGES_DIR = Path(__file__).resolve().parent / "test_debug_images"
 
 
-@pytest.fixture(scope="session", autouse=True)
+@pytest.fixture(scope="module", autouse=True)
 def setup_env(tmp_path_factory):
     """Set up environment variables for all tests."""
-    jax_cache = tmp_path_factory.mktemp("jax_cache")
-    jax.config.update("jax_compilation_cache_dir", str(jax_cache))
     yield
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def droid_config():
     """Create test-specific config instance for DROID cameras (shared across all tests)."""
     config = FrankaPickAndPlaceDroidTestConfig()
@@ -67,24 +64,31 @@ def droid_config():
     return config
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def droid_task_sampler(droid_config):
     """Create and initialize task sampler once for all DROID tests (expensive initialization)."""
     task_sampler_config = droid_config.task_sampler_config
     task_sampler_class = task_sampler_config.task_sampler_class
     task_sampler = task_sampler_class(droid_config)
+    # Re-seed right before sampling starts, so this test's determinism is
+    # anchored at the moment sampling begins rather than depending on anything
+    # that happened earlier in __init__ (env/resource-manager setup). This is
+    # a defensive hardening, not a root-cause fix for a specific known issue --
+    # see PR discussion for what's actually been ruled in/out.
+    task_sampler.seed_task_sampling(task_sampler.current_seed)
     task_sampler.reset()
-    return task_sampler
+    yield task_sampler
+    task_sampler.env.close()
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def droid_task(droid_task_sampler):
     """Sample task once for all DROID tests (expensive operation)."""
     task = droid_task_sampler.sample_task()
     return task
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def droid_policy_results(droid_config, droid_task):
     """Run policy once for all DROID tests (expensive operation)."""
     # Reset task to initial state
@@ -92,8 +96,8 @@ def droid_policy_results(droid_config, droid_task):
 
     # Instantiate policy with config and task
     policy_config = droid_config.policy_config
-    policy_cls = policy_config.policy_cls
-    policy = policy_cls(droid_config, droid_task)
+    policy_factory = policy_config.policy_factory
+    policy = policy_factory(droid_config, droid_task)
     policy.reset()
 
     # Run policy for 10 steps and get both qpos and observations
@@ -111,7 +115,7 @@ def droid_policy_results(droid_config, droid_task):
     }
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def gopro_config():
     """Create test-specific config instance for GoPro/D405/D455 cameras (shared across all tests)."""
     config = FrankaPickAndPlaceGoProD405D455TestConfig()
@@ -122,24 +126,31 @@ def gopro_config():
     return config
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def gopro_task_sampler(gopro_config):
     """Create and initialize task sampler once for all GoPro tests (expensive initialization)."""
     task_sampler_config = gopro_config.task_sampler_config
     task_sampler_class = task_sampler_config.task_sampler_class
     task_sampler = task_sampler_class(gopro_config)
+    # Re-seed right before sampling starts, so this test's determinism is
+    # anchored at the moment sampling begins rather than depending on anything
+    # that happened earlier in __init__ (env/resource-manager setup). This is
+    # a defensive hardening, not a root-cause fix for a specific known issue --
+    # see PR discussion for what's actually been ruled in/out.
+    task_sampler.seed_task_sampling(task_sampler.current_seed)
     task_sampler.reset()
-    return task_sampler
+    yield task_sampler
+    task_sampler.env.close()
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def gopro_task(gopro_task_sampler):
     """Sample task once for all GoPro tests (expensive operation)."""
     task = gopro_task_sampler.sample_task()
     return task
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def gopro_policy_results(gopro_config, gopro_task):
     """Run policy once for all GoPro tests (expensive operation)."""
     # Reset task to initial state
@@ -147,8 +158,8 @@ def gopro_policy_results(gopro_config, gopro_task):
 
     # Instantiate policy with config and task
     policy_config = gopro_config.policy_config
-    policy_cls = policy_config.policy_cls
-    policy = policy_cls(gopro_config, gopro_task)
+    policy_factory = policy_config.policy_factory
+    policy = policy_factory(gopro_config, gopro_task)
     policy.reset()
 
     # Run policy for 10 steps and get both qpos and observations

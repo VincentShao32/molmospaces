@@ -1,25 +1,26 @@
 """
-This module provides forward and inverse kinematics functionality for robots in MuJoCo.
-It implements both forward kinematics (FK) and inverse kinematics (IK) solvers, as well as
-methods for converting between joint velocities and end-effector twists.
-
-The main class, MujocoKinematics, provides a general-purpose interface for computing
-kinematic quantities for any robot that can be represented in MuJoCo. It works with the
-RobotView abstraction to handle different types of robots and their move groups.
+General-purpose forward and inverse kinematics solver for robots in MuJoCo.
+This solver is not parallelizable and runs on the CPU. While fairly fast,
+this is not suitable for large batches.
 """
 
-from typing import Literal
+import logging
+from typing import TYPE_CHECKING, Literal
 
 import mujoco
 import numpy as np
-from mujoco import MjData
 
-from molmo_spaces.robots.robot_views.abstract import RobotView
 from molmo_spaces.utils.linalg_utils import (
     inverse_homogeneous_matrix,
     relative_to_global_transform,
     transform_to_twist,
 )
+
+if TYPE_CHECKING:
+    from molmo_spaces.configs.robot_configs import BaseRobotConfig
+
+
+log = logging.getLogger(__name__)
 
 
 class MlSpacesKinematics:
@@ -33,19 +34,28 @@ class MlSpacesKinematics:
     making it flexible for different use cases.
     """
 
-    def __init__(self, data: MjData, robot_view: RobotView) -> None:
-        """Initialize the kinematics solver.
-        This constructor will directly use the data and robot_view objects for internal computations.
-        Subclasses can copy the passed-in data before invoking this super constructor to maintain
-        a private copy of the data, so as to not conflict with client code.
+    def __init__(self, robot_config: "BaseRobotConfig") -> None:
+        """
+        Create a kinematics solver for a robot.
 
         Args:
-            data: The simulation state. This object is directly used internally for kinematics computations.
-            robot_view: A RobotView instance bound to data representing the robot to compute kinematics for
+            robot_config: The robot configuration.
         """
-        self._mj_model = data.model
-        self._mj_data = data
-        self._robot_view = robot_view
+        spec = mujoco.MjSpec()
+        robot_config.robot_cls.add_robot_to_scene(
+            robot_config,
+            spec,
+            prefix=robot_config.robot_namespace,
+            pos=[0.0, 0.0, 0.0],
+            quat=[1.0, 0.0, 0.0, 0.0],
+            strip_meshes=True,
+        )
+
+        self._mj_model = spec.compile()
+        self._mj_data = mujoco.MjData(self._mj_model)
+        self._robot_view = robot_config.robot_view_factory(
+            self._mj_data, robot_config.robot_namespace
+        )
         mujoco.mj_forward(self._mj_model, self._mj_data)
 
     def _constrain_state(self) -> None:
@@ -145,7 +155,9 @@ class MlSpacesKinematics:
 
         J = self._robot_view.get_jacobian(move_group_id, unlocked_move_group_ids)
         if (JJT_det := np.linalg.det(J @ J.T)) < 1e-20:
-            print(f"WARN: IK Jacobian is rank deficient! det(JJ^T)={JJT_det:.0e}")
+            log.warning(
+                f"[MlSpacesKinematics][{self._robot_view.name}] IK Jacobian is rank deficient! det(JJ^T)={JJT_det:.0e}"
+            )
         H = J @ J.T + damping * np.eye(J.shape[0])
         q_dot = J.T @ np.linalg.solve(H, twist)
         return q_dot
@@ -154,7 +166,7 @@ class MlSpacesKinematics:
         self,
         move_group_id: str,
         pose: np.ndarray,
-        unlocked_move_group_ids: list[str],
+        unlocked_move_group_ids: list[str] | None,
         q0: dict[str, np.ndarray],
         base_pose: np.ndarray,
         rel_to_base: bool = False,
@@ -191,6 +203,10 @@ class MlSpacesKinematics:
             raise ValueError(
                 f"q0 keys must match move group ids: {set(q0.keys())} != {set(self._robot_view.move_group_ids())}"
             )
+
+        if unlocked_move_group_ids is None:
+            unlocked_move_group_ids = self._robot_view.move_group_ids()
+
         self._robot_view.base.pose = base_pose
         self._robot_view.set_qpos_dict(q0)
         if rel_to_base:
@@ -218,7 +234,9 @@ class MlSpacesKinematics:
 
             J: np.ndarray = self._robot_view.get_jacobian(move_group_id, unlocked_move_group_ids)
             if (JJT_det := np.linalg.det(J @ J.T)) < 1e-20:
-                print(f"WARN: IK Jacobian is rank deficient! det(JJ^T)={JJT_det:.0e}")
+                log.warning(
+                    f"[MlSpacesKinematics][{self._robot_view.name}] IK Jacobian is rank deficient! det(JJ^T)={JJT_det:.0e}"
+                )
 
             H = J @ J.T + damping * np.eye(J.shape[0])
             q_dot = J.T @ np.linalg.solve(H, err)

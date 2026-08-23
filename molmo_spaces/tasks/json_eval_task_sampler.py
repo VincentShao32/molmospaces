@@ -241,6 +241,12 @@ class JsonEvalTaskSampler(BaseMujocoTaskSampler):
             # No eval system — use recorded cameras as-is
             exp_config.camera_config = self._recorded_camera_config
 
+        # Override depth if the policy requires it
+        if exp_config.policy_config.force_enable_depth:
+            log.info("Force enabling depth for all cameras")
+            for camera in exp_config.camera_config.cameras:
+                camera.record_depth = True
+
         # Override exp_config.task_type to match the episode spec's task
         # The task class's judge_success() method checks config.task_type, so it must match.
         exp_config.task_type = self._infer_task_type(episode_spec)
@@ -255,6 +261,10 @@ class JsonEvalTaskSampler(BaseMujocoTaskSampler):
         # TODO(RMH): Add input arg for noise level (high, low, medium) to support noisy eval
         if exp_config.robot_config.action_noise_config is not None:
             exp_config.robot_config.action_noise_config.enabled = False
+
+        # Apply robot-specific evaluation overrides. This is a little hacky, so use sparingly.
+        if exp_config.eval_runtime_params and exp_config.eval_runtime_params.robot_override_fn:
+            exp_config.eval_runtime_params.robot_override_fn(episode_spec, exp_config)
 
         super().__init__(exp_config)
 
@@ -352,7 +362,7 @@ class JsonEvalTaskSampler(BaseMujocoTaskSampler):
 
         om = env.object_managers[env.current_batch_index]
         pickup_obj = om.get_object_by_name(self.episode_spec.task["pickup_obj_name"])
-        from molmo_spaces.utils.grasp_sample import has_joint_grasp_file
+        from molmo_spaces.utils.grasps import get_joint_grasp_path
 
         if not isinstance(pickup_obj, MlSpacesArticulationObject):
             return
@@ -373,7 +383,7 @@ class JsonEvalTaskSampler(BaseMujocoTaskSampler):
                 .get("joints", {})
                 .get(joint_name, None)
             )
-            if has_joint_grasp_file(thor_object_name, thor_joint_name):
+            if get_joint_grasp_path(thor_object_name, thor_joint_name) is not None:
                 joint_names_with_grasp_file.append(joint_name)
         if len(joint_names_with_grasp_file) == 0:
             raise ValueError(f"No joints with grasp file found for {pickup_obj.name}")
@@ -603,16 +613,13 @@ class JsonEvalTaskSampler(BaseMujocoTaskSampler):
                 try:
                     body = create_mlspaces_body(data, body_name)
                 except KeyError:
-                    # Get available body names for debugging
-                    available_bodies = [data.body(i).name for i in range(model.nbody)]
-                    log.error(
-                        f"Body '{body_name}' from episode_spec not found in scene. "
+                    log.warning(
+                        f"Body '{body_name}' from object_poses not found in scene — skipping. "
                         f"Episode spec: house_index={self.episode_spec.house_index}, "
                         f"scene_dataset={self.episode_spec.scene_dataset}, "
-                        f"data_split={self.episode_spec.data_split}. "
-                        f"Available bodies ({len(available_bodies)}): {available_bodies[:10]}..."
+                        f"data_split={self.episode_spec.data_split}."
                     )
-                    raise
+                    continue
                 pos_close = np.allclose(body.position, pose[0:3], atol=1e-3)
                 orn_diff = R.from_quat(body.quat).inv() * R.from_quat(pose[3:7])
                 orn_close = orn_diff.magnitude() < 1e-2
@@ -638,6 +645,9 @@ class JsonEvalTaskSampler(BaseMujocoTaskSampler):
             if "head" in robot.robot_view.move_group_ids():
                 head_mg = robot.robot_view.get_move_group("head")
                 head_mg.ctrl = head_mg.noop_ctrl
+            # recompute control
+            robot.set_stationary()
+            robot.compute_control()
         log.info("Scene setup from episode spec completed.")
 
     def _randomize_colors(self, env: CPUMujocoEnv) -> None:
@@ -655,7 +665,7 @@ class JsonEvalTaskSampler(BaseMujocoTaskSampler):
             om = env.object_managers[env.current_batch_index]
             for object_name, color_rgba in object_colors.items():
                 body_id = om.get_object_body_id(object_name)
-                for geom_id in descendant_geoms(model, body_id, visual_only=True):
+                for geom_id in descendant_geoms(model, body_id, visible_only=True):
                     model.geom_matid[geom_id] = -1
                     model.geom_rgba[geom_id] = color_rgba
                 log.info(f"Colored object {object_name}")
@@ -845,6 +855,12 @@ class JsonEvalTaskSampler(BaseMujocoTaskSampler):
         robot_pose_m = pos_quat_to_pose_mat(robot_base_pose[0:3], robot_base_pose[3:7])
         robot_view.base.pose = robot_pose_m
 
+        # Reset controllers
+        for controller in env.current_robot.controllers.values():
+            controller.reset()
+        env.current_robot.set_stationary()
+        env.current_robot.compute_control()
+
         # Forward to update positions
         mujoco.mj_forward(env.current_model, env.current_data)
 
@@ -855,7 +871,7 @@ class JsonEvalTaskSampler(BaseMujocoTaskSampler):
             om = env.object_managers[env.current_batch_index]
             for object_name, color_rgba in object_colors.items():
                 body_id = om.get_object_body_id(object_name)
-                for geom_id in descendant_geoms(model, body_id, visual_only=True):
+                for geom_id in descendant_geoms(model, body_id, visible_only=True):
                     model.geom_matid[geom_id] = -1
                     model.geom_rgba[geom_id] = color_rgba
                 log.info(f"Colored object {object_name}")

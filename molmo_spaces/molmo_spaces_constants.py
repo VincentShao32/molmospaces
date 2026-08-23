@@ -5,11 +5,14 @@ Overwrite in the environment with e.g.:
     MLSPACES_ASSETS_DIR=/Users/username/mlspaces_resources mjpython scripts/...
 """
 
+import base64
 import itertools
 import json
 import logging
 import os
 from collections import defaultdict
+from copy import deepcopy
+from importlib.metadata import version
 from pathlib import Path
 
 import compress_json
@@ -20,6 +23,7 @@ from molmospaces_resources import (
     setup_resource_manager,
     str2bool,
 )
+from packaging.version import Version
 
 
 def single_thread_environment():
@@ -52,12 +56,21 @@ if str2bool(os.environ.get("MLSPACES_SINGLE_THREAD_PROCS", "False")):
 
 ABS_PATH_OF_TOP_LEVEL_MOLMO_SPACES_DIR = Path(__file__).resolve().parent.parent
 
-_DATA_CACHE_DEFAULT = Path("/gpfs/scrubbed/yunbos/video_datasets/molmospaces/generated_cache")
+_DATA_CACHE_DEFAULT = Path("~/.cache/molmo-spaces-resources").expanduser()
 DATA_CACHE_DIR = Path(os.environ.get("MLSPACES_CACHE_DIR", _DATA_CACHE_DEFAULT))
 
+# Each molmospaces installation needs its own assets directory.
+# The default ASSETS_DIR will be in the user's cache directory,
+# but uses a unique hash of the installation path to avoid conflicts.
+_install_hash = (
+    base64.urlsafe_b64encode(str(ABS_PATH_OF_TOP_LEVEL_MOLMO_SPACES_DIR).encode())
+    .decode()
+    .rstrip("=")
+)
 ASSETS_DIR = Path(
     os.environ.get(
-        "MLSPACES_ASSETS_DIR", "/gpfs/scrubbed/yunbos/video_datasets/molmospaces/generated"
+        "MLSPACES_ASSETS_DIR",
+        Path.home() / ".cache" / "molmospaces" / "assets" / _install_hash,
     )
 )
 ROBOTS_DIR = ASSETS_DIR / "robots"
@@ -82,17 +95,20 @@ DATA_TYPE_TO_SOURCE_TO_VERSION = dict(
         "floating_rum": "20251110",
         "floating_robotiq": "20260208_retry4",
         "franka_fr3": "20260303",
+        "i2rt_yam": "20260223",
+        "g1": "20260802",
+        "humans_rocketbox": "20260812",
     },
     scenes={
-        "ithor": "20251217",
+        "ithor": "20251217_with_occupancy",
         "refs": "20250923",
-        "procthor-10k-train": "20251122",
-        "procthor-10k-val": "20251217",
-        "procthor-10k-test": "20251121",
-        "holodeck-objaverse-train": "20251217",
-        "holodeck-objaverse-val": "20251217",
-        "procthor-objaverse-train": "20251205",
-        "procthor-objaverse-val": "20251205",
+        "procthor-10k-train": "20251122_with_occupancy",
+        "procthor-10k-val": "20251217_with_occupancy",  # "20251121" for nav_to_obj benchmark
+        "procthor-10k-test": "20251121_with_occupancy",
+        "holodeck-objaverse-train": "20251217_with_occupancy",
+        "holodeck-objaverse-val": "20251217_with_occupancy",
+        "procthor-objaverse-train": "20251205_with_occupancy",
+        "procthor-objaverse-val": "20251205_with_occupancy",
     },
     objects={
         "thor": "20251117",
@@ -104,10 +120,10 @@ DATA_TYPE_TO_SOURCE_TO_VERSION = dict(
         "droid_objaverse": "20251218",
     },
     test_data={
-        "franka_pick": "20260209",
-        "franka_pick_and_place": "20260305",
-        "rby1_door_opening": "20260228",
-        "rby1_pnp": "20260305",
+        "franka_pick": "20260610",
+        "franka_pick_and_place": "20260529",
+        "rby1_door_opening": "20260812_2",
+        "rby1_pnp": "20260610",
         "rum_open_close": "20260305",
         "rum_pick": "20260209",
         "test_randomized_data": "20251209",
@@ -115,9 +131,21 @@ DATA_TYPE_TO_SOURCE_TO_VERSION = dict(
     },
     benchmarks={
         "molmospaces-bench-v1": "20260408",
-        "molmospaces-bench-v2": "20240407",
+        "molmospaces-bench-v2": "20260415",
     },
 )
+
+
+# Maps asset libraries to a list of corresponding grasp libraries, in descending priority
+OBJECT_LIBRARY_TO_GRASP_LIBRARIES = {
+    "thor": ["droid"],
+    "objaverse": ["droid_objaverse"],
+}
+
+USER_ASSET_LIBRARIES: dict[str, Path] = {}
+
+USER_GRASP_LIBRARIES: dict[str, Path] = {}
+
 
 _RESOURCE_MANAGER = None
 SCENES_TO_FORCE_INSTALL = ("procthor-10k-train",)
@@ -144,9 +172,103 @@ def _download_excluded_sources() -> set[tuple[str, str]]:
     return excluded
 
 
-def get_resource_manager(force_post_setup: bool = False):
+def register_user_asset_library(name: str, path: Path):
+    """
+    Register a user-provided asset library. The library dir should contain an assets_index.json
+    which contains a dict[str, UserAssetLibraryIndexEntry].
+
+    The library name must not conflict with a built-in object source or any other user-provided library.
+
+    Args:
+        name: The name of the user-provided asset library.
+        path: The path to the user-provided asset library directory.
+    """
+    assert "/" not in name, f"User library name {name} must not contain slashes"
+    if name in USER_ASSET_LIBRARIES:
+        raise ValueError(f"User library {name} already registered")
+    if name in DATA_TYPE_TO_SOURCE_TO_VERSION["objects"]:
+        raise ValueError(f"User library {name} name conflicts with a built-in object source")
+    if not (path / "assets_index.json").exists():
+        raise ValueError(
+            f"User library {name} path {path} does not contain an assets_index.json file"
+        )
+    USER_ASSET_LIBRARIES[name] = path
+
+
+def register_user_grasp_library(root_name: str, path: Path, object_library: str):
+    """
+    Register a user-provided grasp library. The library dir should contain a grasps_index.json
+    which contains a UserGraspLibraryIndex.
+
+    Args:
+        root_name: The root name of the grasp library, will be used with the robot name to form the grasp library name.
+        path: The path to the user-provided grasp library directory.
+        object_library: The object library (user-provided or built-in) which this grasp library is for.
+            It must have already been registered.
+    """
+    grasps_index_path = path / "grasps_index.json"
+    if not grasps_index_path.exists():
+        raise ValueError(f"{grasps_index_path} does not exist")
+    if (
+        object_library not in USER_ASSET_LIBRARIES
+        and object_library not in DATA_TYPE_TO_SOURCE_TO_VERSION["objects"]
+    ):
+        raise ValueError(f"Object library {object_library} not found")
+
+    from molmo_spaces.utils.lazy_loading_utils import UserGraspLibraryIndex
+
+    with open(grasps_index_path, "r") as f:
+        grasp_index = UserGraspLibraryIndex.model_validate_json(f.read())
+
+    grasp_robots = set(grasp_index.grasp_paths.keys()) | set(
+        grasp_index.articulated_grasp_paths.keys()
+    )
+    grasp_libraries = [f"{root_name}/{robot}" for robot in grasp_robots]
+
+    for grasp_library in grasp_libraries:
+        if grasp_library in USER_GRASP_LIBRARIES:
+            raise ValueError(f"User grasp library {grasp_library} already registered")
+        if grasp_library in DATA_TYPE_TO_SOURCE_TO_VERSION["grasps"]:
+            raise ValueError(
+                f"User grasp library {grasp_library} name conflicts with a built-in grasp source"
+            )
+
+        USER_GRASP_LIBRARIES[grasp_library] = path
+
+        if object_library not in OBJECT_LIBRARY_TO_GRASP_LIBRARIES:
+            OBJECT_LIBRARY_TO_GRASP_LIBRARIES[object_library] = []
+        # newer grasp libraries have precedence over older ones
+        OBJECT_LIBRARY_TO_GRASP_LIBRARIES[object_library].insert(0, grasp_library)
+
+
+def _select_storage():
+    return (
+        HFRemoteStorage("allenai/molmospaces", repo_prefix="mujoco", token=os.getenv("HF_TOKEN"))
+        if USE_HUGGING_FACE
+        else R2RemoteStorage("mujoco-thor-resources")
+    )
+
+
+def get_resource_manager(
+    force_post_setup: bool = False, data_type_to_source_to_version: dict | None = None
+):
+    # Note: This would still be effective even wíthin a specific branch in the if-else below.
+    # The scope of variables is defined before execution starts.
     global _RESOURCE_MANAGER
-    if _RESOURCE_MANAGER is None:
+
+    if data_type_to_source_to_version is None:
+        # save resource manager
+        use_global = True
+        data_type_to_source_to_version = DATA_TYPE_TO_SOURCE_TO_VERSION
+    else:
+        use_global = False
+
+    if _RESOURCE_MANAGER is None or not use_global:
+        MIN_VERSION = "0.0.2"
+        if Version(version("molmospaces-resources")) < Version(MIN_VERSION):
+            raise ImportError(
+                f"Please ensure molmospaces_resources is >= min({MIN_VERSION}, <version in pyproject.toml>)"
+            )
 
         def post_setup(manager: ResourceManager):
             if not os.environ.get("_IN_MULTIPROCESSING_CHILD") and str2bool(
@@ -159,16 +281,18 @@ def get_resource_manager(force_post_setup: bool = False):
                     ("objects", False),
                     ("grasps", False),
                 ):
-                    for source in DATA_TYPE_TO_SOURCE_TO_VERSION.get(data_type, {}):
+                    for source in data_type_to_source_to_version.get(data_type, {}):
                         if (data_type, source) in excluded:
                             continue
                         kwargs = {"skip_linking": True} if skip_link else {}
                         manager.install_all_for_source(data_type, source, **kwargs)
             else:
                 to_install = {}
-                for scene_source in DATA_TYPE_TO_SOURCE_TO_VERSION["scenes"]:
+                for scene_source in data_type_to_source_to_version["scenes"]:
                     source_packages = manager.find_all_packages_for_source("scenes", scene_source)
-                    if len(source_packages) < 10 or scene_source in SCENES_TO_FORCE_INSTALL:                        # Fully install small scene datasets
+                    if len(source_packages) < 10 or scene_source in SCENES_TO_FORCE_INSTALL:
+                        # Fully install small scene datasets and the project-required
+                        # ProcTHOR training split.
                         packages = source_packages
                     else:
                         # Install unindexed scene archives
@@ -182,19 +306,21 @@ def get_resource_manager(force_post_setup: bool = False):
 
         # resource_manager_log_level()
 
-        _RESOURCE_MANAGER = setup_resource_manager(
-            HFRemoteStorage(
-                "allenai/molmospaces", repo_prefix="mujoco", token=os.getenv("HF_TOKEN")
-            )
-            if USE_HUGGING_FACE
-            else R2RemoteStorage("mujoco-thor-resources"),
+        manager = setup_resource_manager(
+            _select_storage(),
             symlink_dir=ASSETS_DIR,
-            versions=DATA_TYPE_TO_SOURCE_TO_VERSION,
+            versions=data_type_to_source_to_version,
             cache_dir=DATA_CACHE_DIR,
             env_prefix="MLSPACES",
             post_setup=post_setup,
             force_post_setup=force_post_setup,
         )
+
+        if use_global:
+            _RESOURCE_MANAGER = manager
+        else:
+            return manager
+
     return _RESOURCE_MANAGER
 
 
@@ -248,7 +374,7 @@ def get_scenes_root():
             _SCENES_ROOT = Path(
                 os.environ.get(
                     "MLSPACES_SCENES_ROOT",
-                    ABS_PATH_OF_TOP_LEVEL_MOLMO_SPACES_DIR / "assets" / "scenes",
+                    ASSETS_DIR / "scenes",
                 )
             )
         print(f"Using SCENES_ROOT: {_SCENES_ROOT}")
@@ -575,18 +701,66 @@ def get_holodeck_objaverse_houses(split) -> dict:
 
 
 def get_robot_paths() -> dict[str, Path]:
-    """Return {robot_name: Path} for all available robot files."""
+    """Return {robot_name: Path} for all prepackaged MlSpaces robot files."""
     robot_paths = {}
     for robot_name in os.listdir(ROBOTS_DIR):
         robot_paths[robot_name] = ROBOTS_DIR / robot_name
     return robot_paths
 
 
+def install_missing_source(data_type: str, missing_source: str, existing_sources: list[str]):
+    from molmospaces_resources.manager import LOCAL_MANIFEST_NAME, _lock_context
+    from molmospaces_resources.setup_utils import (
+        _RESOURCE_MANAGERS,
+        _get_current_install,
+        _manager_key,
+    )
+
+    assert missing_source in DATA_TYPE_TO_SOURCE_TO_VERSION[data_type], (
+        f"{missing_source} has no version under {data_type}"
+    )
+
+    data_type_to_source_to_version = deepcopy(DATA_TYPE_TO_SOURCE_TO_VERSION)
+    existing_sources = [
+        source for source in existing_sources if source in data_type_to_source_to_version[data_type]
+    ] + [missing_source]
+    data_type_to_source_to_version[data_type] = {
+        source: DATA_TYPE_TO_SOURCE_TO_VERSION[data_type][source] for source in existing_sources
+    }
+
+    current_install = _get_current_install(ASSETS_DIR, data_type_to_source_to_version)
+    current_install[data_type][missing_source] = None
+    manifest_path = ASSETS_DIR / LOCAL_MANIFEST_NAME
+    key = _manager_key(str(_select_storage()), data_type_to_source_to_version)
+    with _lock_context(ASSETS_DIR, DATA_CACHE_DIR):
+        if key in _RESOURCE_MANAGERS:
+            _RESOURCE_MANAGERS.pop(key)
+        with open(manifest_path, "w") as f:
+            json.dump(current_install, f, indent=2)
+
+    get_resource_manager(data_type_to_source_to_version=data_type_to_source_to_version)
+    assert key in _RESOURCE_MANAGERS, f"BUG: Missing expected {key} from _RESOURCE_MANAGERS"
+
+
 def get_robot_path(robot_name) -> Path:
+    """
+    Return the path to the prepackaged MlSpaces robot file for the given robot name.
+    """
+    robot_dirs = os.listdir(ROBOTS_DIR) if ROBOTS_DIR.is_dir() else []
+    if robot_name not in robot_dirs or not (ROBOTS_DIR / robot_name).is_dir():
+        logging.info(
+            f"Robot {robot_name} not found in {ROBOTS_DIR}. Attempting direct installation."
+        )
+        robot_dirs = [robot_dir for robot_dir in robot_dirs if (ROBOTS_DIR / robot_dir).is_dir()]
+        install_missing_source("robots", robot_name, robot_dirs)
+        assert robot_name in os.listdir(ROBOTS_DIR) and (ROBOTS_DIR / robot_name).is_dir(), (
+            f"Failed to install missing robot {robot_name}"
+        )
+
     return ROBOTS_DIR / robot_name
 
 
-def print_license_info(data_type, data_source, asset_or_tar_id):
+def print_license_info(data_type, data_source, asset_or_tar_id=None):
     from molmo_spaces.utils.license_utils import resolve_license
 
     def get_identifiers():
@@ -596,6 +770,11 @@ def print_license_info(data_type, data_source, asset_or_tar_id):
                 data_type, data_source
             )
         ]
+
+    if asset_or_tar_id is None and data_type != "robots":
+        raise ValueError(
+            f"Missing asset_or_tar_id for {data_type=} {data_source=}. Maybe try with '--list_all'"
+        )
 
     if asset_or_tar_id == "--list_all":
         print(f"Possible identifiers: {sorted(get_identifiers())}")

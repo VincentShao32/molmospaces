@@ -2,8 +2,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from molmo_spaces.policy.base_policy import NONE_PHASE, BasePolicy
-from molmo_spaces.tasks.task import BaseMujocoTask
+from molmo_spaces.policy.base_policy import BasePolicy
 
 if TYPE_CHECKING:
     from molmo_spaces.configs.abstract_exp_config import MlSpacesExpConfig
@@ -17,12 +16,6 @@ class DummyPolicy(BasePolicy):
     @property
     def type(self):
         return "dummy"
-
-    def __init__(self, config: "MlSpacesExpConfig", task: BaseMujocoTask | None = None) -> None:
-        self.config = config
-        # Required attributes for sensors that expect a policy with target poses
-        self.target_poses = {"grasp": np.eye(4)}
-        self.current_phase = NONE_PHASE
 
     def reset(self):
         """
@@ -45,9 +38,8 @@ class DummyPolicy(BasePolicy):
 class BrownianMotionPolicy(DummyPolicy):
     """Policy that applies Gaussian noise increments over noop control, resulting in Brownian motion."""
 
-    def __init__(self, config: "MlSpacesExpConfig", task: BaseMujocoTask | None = None) -> None:
-        super().__init__(config, task)
-        self.task = task
+    def __init__(self, config: "MlSpacesExpConfig") -> None:
+        super().__init__(config)
         self.std = config.policy_config.std
 
     def get_action(self, observation) -> dict:

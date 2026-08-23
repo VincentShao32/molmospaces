@@ -6,7 +6,8 @@ from mujoco import MjData, MjSpec, mjtGeom
 
 from molmo_spaces.controllers.joint_pos import JointPosController
 from molmo_spaces.controllers.joint_rel_pos import JointRelPosController
-from molmo_spaces.kinematics.bimanual_yam_kinematics import BimanualYamKinematics
+from molmo_spaces.env.sensors import TCPPoseSensor
+from molmo_spaces.kinematics.mujoco_kinematics import MlSpacesKinematics
 from molmo_spaces.kinematics.parallel.dummy_parallel_kinematics import (
     DummyParallelKinematics,
 )
@@ -29,19 +30,13 @@ class BimanualYamRobot(Robot):
         self._robot_view = config.robot_config.robot_view_factory(
             mj_data, config.robot_config.robot_namespace
         )
-        self._kinematics = BimanualYamKinematics(
-            self.mj_model,
-            namespace=config.robot_config.robot_namespace,
-            robot_view_factory=config.robot_config.robot_view_factory,
-        )
+        self._kinematics = MlSpacesKinematics(config.robot_config)
 
         # Use DummyParallelKinematics for batch IK (wraps the MlSpacesKinematics)
         # Default to left arm for parallel kinematics
         self._parallel_kinematics = DummyParallelKinematics(
             config.robot_config,
             self._kinematics,
-            mg_id="left_arm",
-            unlocked_mg_ids=["left_arm", "right_arm"],
         )
 
         # Determine controller classes based on command mode
@@ -86,35 +81,15 @@ class BimanualYamRobot(Robot):
     def controllers(self):
         return self._controllers
 
-    @property
-    def state_dim(self) -> int:
-        return 12  # Two 6-DOF arms
-
-    def action_dim(self, move_group_ids: list[str]):
-        return sum(self._robot_view.get_move_group(mg_id).n_actuators for mg_id in move_group_ids)
+    def create_robot_sensors(self):
+        return super().create_robot_sensors() + [
+            TCPPoseSensor(uuid="tcp_pose_left", gripper_mg_id="left_gripper"),
+            TCPPoseSensor(uuid="tcp_pose_right", gripper_mg_id="right_gripper"),
+        ]
 
     def get_arm_move_group_ids(self) -> list[str]:
         """Bimanual YAM has two independent arms."""
         return ["left_arm", "right_arm"]
-
-    def update_control(self, action_command_dict) -> None:
-        for mg_id, controller in self.controllers.items():
-            if mg_id in action_command_dict and action_command_dict[mg_id] is not None:
-                controller.set_target(action_command_dict[mg_id])
-            elif not controller.stationary:
-                controller.set_to_stationary()
-
-    def compute_control(self) -> None:
-        for controller in self.controllers.values():
-            ctrl_inputs = controller.compute_ctrl_inputs()
-            controller.robot_move_group.ctrl = ctrl_inputs
-
-    def set_joint_pos(self, robot_joint_pos_dict) -> None:
-        for mg_id, joint_pos in robot_joint_pos_dict.items():
-            self._robot_view.get_move_group(mg_id).joint_pos = joint_pos
-
-    def set_world_pose(self, robot_world_pose) -> None:
-        self._robot_view.base.pose = robot_world_pose
 
     def reset(self) -> None:
         for mg_id, default_pos in self.exp_config.robot_config.init_qpos.items():
@@ -131,11 +106,11 @@ class BimanualYamRobot(Robot):
         cls,
         robot_config: "BimanualYamRobotConfig",
         spec: MjSpec,
-        robot_spec: MjSpec,
         prefix: str,
         pos: list[float],
         quat: list[float],
         randomize_textures: bool = False,
+        strip_meshes: bool = False,
     ) -> None:
         robot_config = cast("BimanualYamRobotConfig", robot_config)
         add_base = robot_config.base_size is not None
@@ -168,7 +143,7 @@ class BimanualYamRobot(Robot):
         else:
             attach_frame = robot_body.add_frame()
 
-        # Attach the bimanual robot model at the bimanual_base body
+        robot_spec = cls._load_robot_spec(robot_config, strip_meshes=strip_meshes)
         robot_root_name = cls.robot_model_root_name()
         robot_root = robot_spec.body(robot_root_name)
         if robot_root is None:

@@ -31,7 +31,7 @@ TEST_OUTPUT_DIR = Path(__file__).resolve().parent / "test_output"
 DEBUG_IMAGES_DIR = Path(__file__).resolve().parent / "test_debug_images"
 
 
-@pytest.fixture(scope="session", autouse=True)
+@pytest.fixture(scope="module", autouse=True)
 def setup_env():
     """Set up environment variables for all tests."""
     yield
@@ -42,7 +42,7 @@ def setup_env():
 # ==============================================================================
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def rum_open_config():
     """Create test-specific config instance for RUM open (shared across all tests)."""
     config = RUMOpenTestConfig()
@@ -53,24 +53,31 @@ def rum_open_config():
     return config
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def rum_open_task_sampler(rum_open_config):
     """Create and initialize task sampler once for all RUM open tests (expensive initialization)."""
     task_sampler_config = rum_open_config.task_sampler_config
     task_sampler_class = task_sampler_config.task_sampler_class
     task_sampler = task_sampler_class(rum_open_config)
+    # Re-seed right before sampling starts, so this test's determinism is
+    # anchored at the moment sampling begins rather than depending on anything
+    # that happened earlier in __init__ (env/resource-manager setup). This is
+    # a defensive hardening, not a root-cause fix for a specific known issue --
+    # see PR discussion for what's actually been ruled in/out.
+    task_sampler.seed_task_sampling(task_sampler.current_seed)
     task_sampler.reset()
-    return task_sampler
+    yield task_sampler
+    task_sampler.env.close()
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def rum_open_task(rum_open_task_sampler):
     """Sample task once for all RUM open tests (expensive operation)."""
     task = rum_open_task_sampler.sample_task()
     return task
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def rum_open_policy_results(rum_open_config, rum_open_task):
     """Run policy once for all RUM open tests (expensive operation)."""
     # Reset task to initial state
@@ -78,8 +85,8 @@ def rum_open_policy_results(rum_open_config, rum_open_task):
 
     # Instantiate policy with config and task
     policy_config = rum_open_config.policy_config
-    policy_cls = policy_config.policy_cls
-    policy = policy_cls(rum_open_config, rum_open_task)
+    policy_factory = policy_config.policy_factory
+    policy = policy_factory(rum_open_config, rum_open_task)
     policy.reset()
 
     # Run policy for 10 steps and get both qpos and observations
@@ -102,7 +109,7 @@ def rum_open_policy_results(rum_open_config, rum_open_task):
 # ==============================================================================
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def rum_close_config():
     """Create test-specific config instance for RUM close (shared across all tests)."""
     config = RUMCloseTestConfig()
@@ -113,24 +120,31 @@ def rum_close_config():
     return config
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def rum_close_task_sampler(rum_close_config):
     """Create and initialize task sampler once for all RUM close tests (expensive initialization)."""
     task_sampler_config = rum_close_config.task_sampler_config
     task_sampler_class = task_sampler_config.task_sampler_class
     task_sampler = task_sampler_class(rum_close_config)
+    # Re-seed right before sampling starts, so this test's determinism is
+    # anchored at the moment sampling begins rather than depending on anything
+    # that happened earlier in __init__ (env/resource-manager setup). This is
+    # a defensive hardening, not a root-cause fix for a specific known issue --
+    # see PR discussion for what's actually been ruled in/out.
+    task_sampler.seed_task_sampling(task_sampler.current_seed)
     task_sampler.reset()
-    return task_sampler
+    yield task_sampler
+    task_sampler.env.close()
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def rum_close_task(rum_close_task_sampler):
     """Sample task once for all RUM close tests (expensive operation)."""
     task = rum_close_task_sampler.sample_task()
     return task
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def rum_close_policy_results(rum_close_config, rum_close_task):
     """Run policy once for all RUM close tests (expensive operation)."""
     # Reset task to initial state
@@ -138,8 +152,8 @@ def rum_close_policy_results(rum_close_config, rum_close_task):
 
     # Instantiate policy with config and task
     policy_config = rum_close_config.policy_config
-    policy_cls = policy_config.policy_cls
-    policy = policy_cls(rum_close_config, rum_close_task)
+    policy_factory = policy_config.policy_factory
+    policy = policy_factory(rum_close_config, rum_close_task)
     policy.reset()
 
     # Run policy for 10 steps and get both qpos and observations

@@ -15,8 +15,8 @@ should not be looked up via :func:`get_config_class`.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 log = logging.getLogger(__name__)
 

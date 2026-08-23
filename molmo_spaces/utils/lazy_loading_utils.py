@@ -1,14 +1,38 @@
 import xml.etree.ElementTree as ET
+from functools import cache
 from pathlib import Path
 
 from molmospaces_resources import split_query_tokens
+from pydantic import BaseModel, Field, TypeAdapter
 
 from molmo_spaces.molmo_spaces_constants import (
     ASSETS_DIR,
     DATA_TYPE_TO_SOURCE_TO_VERSION,
+    USER_ASSET_LIBRARIES,
     get_resource_manager,
     get_scenes_root,
 )
+
+
+class UserAssetLibraryIndexEntry(BaseModel):
+    # UID of the object
+    uid: str
+    # Path to object MJCF
+    object_path: Path
+    # Path to a json file which contains the object metadata
+    metadata_path: Path
+    # Path to an npz file which contains array-valued metadata (e.g. clip features)
+    metadata_npz_path: Path | None
+
+
+UserAssetLibraryIndex = TypeAdapter(dict[str, UserAssetLibraryIndexEntry])
+
+
+class UserGraspLibraryIndex(BaseModel):
+    # {robot_name: {uid: {joint_name: grasp_path}}} to a NPZ file which contains "transforms" -> (N, 4, 4) array of grasp poses in robot frame
+    articulated_grasp_paths: dict[str, dict[str, dict[str, Path]]] = Field(default_factory=dict)
+    # {robot_name: {uid: grasp_path}} to a NPZ file which contains "transforms" -> (N, 4, 4) array of grasp poses in robot frame
+    grasp_paths: dict[str, dict[str, Path]] = Field(default_factory=dict)
 
 
 def install_scene_from_source_index(source, idx):
@@ -111,17 +135,46 @@ def add_install_prefixes(data_type, source, relative_path):
     return ASSETS_DIR / data_type / source / relative_path
 
 
-def locate_uid_package(uid, extension="xml"):
-    # Remember we install a link to each object source, so we need to resolve
-    # at least until the source
+@cache
+def get_user_library_index(user_library_path: Path):
+    with open(user_library_path / "assets_index.json", "r") as f:
+        return UserAssetLibraryIndex.validate_json(f.read())
 
+
+@cache
+def get_user_grasp_library_index(user_library_path: Path):
+    with open(user_library_path / "grasps_index.json", "r") as f:
+        return UserGraspLibraryIndex.model_validate_json(f.read())
+
+
+@cache
+def get_thor_uid_to_xmls() -> dict[str, Path]:
     base = (ASSETS_DIR / "objects" / "thor").resolve()
+    return {xml.stem: xml for xml in base.rglob("*.xml")}
+
+
+def locate_uid_package(
+    uid: str,
+    extension: str = "xml",
+) -> tuple[str, str | None, Path] | tuple[None, None, None]:
+    """
+    Locate the package containing the given object UID.
+
+    Args:
+        uid: The UID of the object to locate.
+        extension: The extension of the file to locate.
+
+    Returns:
+        A tuple containing the source, package, and XML path of the object.
+            If the object is not found, returns (None, None, None).
+    """
 
     # Since thor objects are always fully installed, we just search in the file system
-    candidate_receptacle_xmls = list(base.rglob(f"{uid}.xml"))
+    thor_uid_to_xmls = get_thor_uid_to_xmls()
 
-    if candidate_receptacle_xmls:
-        xml_path = candidate_receptacle_xmls[0]
+    if uid in thor_uid_to_xmls:
+        base = (ASSETS_DIR / "objects" / "thor").resolve()
+        xml_path = thor_uid_to_xmls[uid]
         return "thor", None, add_install_prefixes("objects", "thor", xml_path.relative_to(base))
 
     file_name = f"{uid}.{extension}"
@@ -151,10 +204,16 @@ def locate_uid_package(uid, extension="xml"):
                             add_install_prefixes("objects", object_source, path),
                         )
 
+    for user_library_name, user_library_dir in USER_ASSET_LIBRARIES.items():
+        user_library_index = get_user_library_index(user_library_dir)
+        if uid in user_library_index:
+            # Assume the user is getting the object
+            return user_library_name, None, user_library_dir / user_library_index[uid].object_path
+
     return None, None, None
 
 
-def install_uid(uid, grasp_source="droid_objaverse", exclude_thor=True):
+def install_uid(uid, grasp_source="droid_objaverse"):
     source, package, xml_path = locate_uid_package(uid)
 
     if source is None:
@@ -162,7 +221,10 @@ def install_uid(uid, grasp_source="droid_objaverse", exclude_thor=True):
             f"{uid} not found in object sources {sorted(DATA_TYPE_TO_SOURCE_TO_VERSION['objects'].keys())}"
         )
 
-    if source != "thor" or not exclude_thor:
+    if source in USER_ASSET_LIBRARIES:
+        return xml_path
+
+    if source != "thor":
         get_resource_manager().install_packages("objects", {source: [package]})
 
         # Install grasps (on-demand for objaverse)
@@ -179,6 +241,8 @@ def install_uid(uid, grasp_source="droid_objaverse", exclude_thor=True):
 def install_scene_with_objects_and_grasps_from_path(
     xml_path, grasp_sources=("droid_objaverse",), exclude_thor=True
 ):
+    if isinstance(xml_path, dict):
+        xml_path = xml_path["base"]
     type_to_source_to_archives = {
         "scenes": install_scene_from_path(xml_path),
     }

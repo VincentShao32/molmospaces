@@ -1,0 +1,32 @@
+name: Sync branches from upstream
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'   # every 6 hours
+  workflow_dispatch:        # lets you trigger manually too
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/allenai/molmospaces.git
+
+      - name: Fetch upstream main
+        run: git fetch upstream main
+
+      - name: Push upstream/main into this repo as main_public
+        run: git push --force origin refs/remotes/upstream/main:refs/heads/main_public

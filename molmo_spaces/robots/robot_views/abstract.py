@@ -2,18 +2,12 @@
 This module defines the core abstractions for representing and controlling robots in MuJoCo.
 The architecture is based on a hierarchical structure where a RobotView contains multiple MoveGroups,
 each representing an atomic collection of joints and actuators.
-
-The key abstractions are:
-- MoveGroup: Base class for any collection of joints and actuators
-- Arm: A MoveGroup with additional gripper functionality
-- RobotBase: A MoveGroup that controls the overall robot pose
-- RobotView: Top-level class that contains and manages multiple MoveGroups
 """
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from functools import cache, cached_property
-from typing import NoReturn, Optional, TypeAlias
+from functools import cached_property
+from typing import Literal, NoReturn, Optional, TypeAlias
 
 import mujoco
 import numpy as np
@@ -59,6 +53,7 @@ class MoveGroup(ABC):
         """
         self.mj_model = mj_data.model
         self.mj_data = mj_data
+        self._name: str | None = None
         self._joint_ids = joint_ids
         self._robot_base_group = robot_base_group
         self._root_body_id = root_body_id
@@ -82,6 +77,15 @@ class MoveGroup(ABC):
             )
 
         self._actuator_ids = actuator_ids
+
+    @property
+    def name(self) -> str:
+        """
+        The name of this move group, which matches the move group ID in the containing robot view.
+        Not safe to call before the move group is added to a robot view.
+        """
+        assert self._name is not None, "Move group name is not set"
+        return self._name
 
     @cached_property
     def n_joints(self) -> int:
@@ -192,6 +196,7 @@ class MoveGroup(ABC):
         Args:
             joint_pos: Joint positions at the start of the integration
             joint_vel: Joint velocities to integrate
+
         Returns:
             Joint positions at the end of the integration
         """
@@ -281,6 +286,87 @@ class MoveGroup(ABC):
         raise NotImplementedError
 
 
+class MJCFFrameMixin(ABC):
+    """
+    Mixin for move groups that represent the leaf frame as a body or site in the MJCF model.
+
+    Note: Since this mixin provides a `get_jacobian()` implementation, inheriting classes must
+        put this mixin first in the inheritance chain to satisfy the MRO.
+    """
+
+    @property
+    @abstractmethod
+    def leaf_frame_id(self) -> int:
+        """The ID of the leaf frame, either a body ID or a site ID."""
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def leaf_frame_type(self) -> Literal["site", "body"]:
+        """The type of the leaf frame."""
+        raise NotImplementedError
+
+    @property
+    def leaf_frame_to_world(self) -> np.ndarray:
+        assert isinstance(self, MoveGroup)
+        if self.leaf_frame_type == "site":
+            return site_pose(self.mj_data, self.leaf_frame_id)
+        elif self.leaf_frame_type == "body":
+            return body_pose(self.mj_data, self.leaf_frame_id)
+        else:
+            raise ValueError(f"Invalid leaf frame type: {self.leaf_frame_type}")
+
+    def get_jacobian(self) -> np.ndarray:
+        """
+        Returns the (6, model.nv) jacobian of the move group's leaf frame.
+
+        The jacobian maps joint velocities to the spatial velocity of the leaf frame.
+
+        Returns:
+            A 6xN numpy array where N is the number of degrees of freedom in the model.
+
+        See: https://mujoco.readthedocs.io/en/stable/APIreference/APIfunctions.html#mj-jac
+        """
+        assert isinstance(self, MoveGroup), (
+            f"{self.__class__.__name__} must be used with a MoveGroup"
+        )
+
+        J = np.zeros((6, self.mj_model.nv))
+        if self.leaf_frame_type == "site":
+            mujoco.mj_jacSite(self.mj_model, self.mj_data, J[:3], J[3:], self.leaf_frame_id)
+        elif self.leaf_frame_type == "body":
+            mujoco.mj_jacBody(self.mj_model, self.mj_data, J[:3], J[3:], self.leaf_frame_id)
+        else:
+            raise ValueError(f"Invalid leaf frame type: {self.leaf_frame_type}")
+        return J
+
+
+class SimplyActuatedMoveGroup(MoveGroup):
+    """
+    A SimplyActuatedMoveGroup is a move group with a 1:1 mapping between joints, actuators, and position/velocity addresses.
+    """
+
+    @property
+    def joint_ids(self):
+        return self._joint_ids
+
+    @property
+    def actuator_ids(self):
+        return self._actuator_ids
+
+    @property
+    def joint_posadr(self):
+        return self._joint_posadr
+
+    @property
+    def joint_veladr(self):
+        return self._joint_veladr
+
+    @property
+    def noop_ctrl(self) -> np.ndarray:
+        return self.joint_pos.copy()
+
+
 class GripperGroup(MoveGroup):
     @abstractmethod
     def set_gripper_ctrl_open(self, open: bool) -> None:
@@ -354,7 +440,7 @@ class RobotBaseGroup(MoveGroup):
 
     @pose.setter
     @abstractmethod
-    def pose(self, pose: np.ndarray) -> NoReturn:
+    def pose(self, pose: np.ndarray):
         """Set the pose of the robot base relative to the world frame.
 
         Args:
@@ -431,7 +517,7 @@ class FreeJointRobotBaseGroup(RobotBaseGroup):
         return J
 
 
-class HoloJointsRobotBaseGroup(RobotBaseGroup):
+class HoloJointsRobotBaseGroup(RobotBaseGroup, SimplyActuatedMoveGroup):
     """A RobotBase that uses virtual holonomic joints to represent its pose.
 
     Assumes three virtual holonomic joints for x, y, and theta control.
@@ -455,13 +541,21 @@ class HoloJointsRobotBaseGroup(RobotBaseGroup):
             joint_ids: List of joint IDs that belong to the virtual holonomic base pose.
                        NOTE: Assumed order is [x, y, theta].
             actuator_ids: List of actuator IDs that control the base
+            root_body_id: The ID of the body that represents the robot base
         """
         super().__init__(mj_data, joint_ids, actuator_ids, root_body_id)
+
+        assert len(joint_ids) == 3, "HoloJointsRobotBaseGroup must have 3 joints (x, y, theta)"
         assert all(
-            self.mj_model.jnt_type[jid] == mujoco.mjtJoint.mjJNT_HINGE
-            or self.mj_model.jnt_type[jid] == mujoco.mjtJoint.mjJNT_SLIDE
-            for jid in joint_ids
-        ), "All holonomic joints must be position joints (hinge or slide)"
+            self.mj_model.jnt_type[jid] == mujoco.mjtJoint.mjJNT_SLIDE for jid in joint_ids[:2]
+        ), "x, y joints must be slide joints"
+        assert self.mj_model.jnt_type[joint_ids[2]] == mujoco.mjtJoint.mjJNT_HINGE, (
+            "theta joint must be hinge"
+        )
+        assert len(actuator_ids) == 3, (
+            "HoloJointsRobotBaseGroup must have 3 actuators (x, y, theta)"
+        )
+
         self._world_site_id = world_site_id
         self._holo_base_site_id = holo_base_site_id
 
@@ -496,16 +590,11 @@ class HoloJointsRobotBaseGroup(RobotBaseGroup):
         Args:
             ctrl: Array of control signals to set
         """
-        # Wrap target theta to [-pi, pi]
-        ctrl[2] = normalize_ang_error(ctrl[2])
+        ctrl = ctrl.copy()
 
-        # The theta actuator can flip the robot base from -pi to pi when crossing zero.
-        # To avoid this, current solution is to just set the joint positions to the
-        # flipped side ctrl position (without physics simulation)
-        theta_qpos_idx = self.mj_model.jnt_qposadr[self._joint_ids[2]]
-        current_theta = self.mj_data.qpos[theta_qpos_idx]
-        if np.abs(current_theta - ctrl[2]) > np.pi:
-            self.mj_data.qpos[theta_qpos_idx] = ctrl[2]
+        # Wrap target yaw to be within +-pi of current yaw
+        curr_yaw = self.joint_pos[2]
+        ctrl[2] = curr_yaw + normalize_ang_error(ctrl[2] - curr_yaw)
 
         self.mj_data.ctrl[self._actuator_ids] = ctrl
 
@@ -611,6 +700,9 @@ class RobotView(ABC):
         self.mj_model = mj_data.model
         self.mj_data = mj_data
         self._move_groups = move_groups
+        for mg_name, mg in move_groups.items():
+            assert mg._name is None, f"Move group {mg_name} already has a name {mg._name}"
+            mg._name = mg_name
 
     @property
     @abstractmethod
@@ -657,6 +749,7 @@ class RobotView(ABC):
         Args:
             move_group_ids: The IDs of the move groups to get the joint positions of.
                             If None, all move groups will be included.
+
         Returns:
             A dictionary mapping move group IDs to their joint positions.
         """
@@ -670,6 +763,7 @@ class RobotView(ABC):
         Args:
             move_group_ids: The IDs of the move groups to get the joint velocities of.
                             If None, all move groups will be included.
+
         Returns:
             A dictionary mapping move group IDs to their joint velocities.
         """
@@ -696,14 +790,16 @@ class RobotView(ABC):
             move_group_ids = self.move_group_ids()
         return {mg_id: self._move_groups[mg_id].noop_ctrl for mg_id in move_group_ids}
 
-    @cache
     def get_gripper_movegroup_ids(self) -> list[str]:
         """Get the IDs of all gripper move groups in this robot."""
-        return [
+        if hasattr(self, "_gripper_movegroup_ids_cache"):
+            return self._gripper_movegroup_ids_cache
+        self._gripper_movegroup_ids_cache = [
             mg_id
             for mg_id in self.move_group_ids()
             if isinstance(self._move_groups[mg_id], GripperGroup)
         ]
+        return self._gripper_movegroup_ids_cache
 
     def get_jacobian(self, move_group_id: str, input_move_group_ids: list[str]) -> np.ndarray:
         """Calculate the Jacobian of a move group with respect to specific input move groups.
@@ -714,6 +810,7 @@ class RobotView(ABC):
         Args:
             move_group_id: The ID of the move group to get the jacobian of
             input_move_group_ids: The IDs of the move groups to use as input
+
         Returns:
             The (6, N) jacobian of the move group, where N is the total number of degrees
             of freedom of the input move groups.

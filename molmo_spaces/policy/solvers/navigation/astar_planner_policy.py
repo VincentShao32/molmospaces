@@ -48,7 +48,7 @@ Some TODOs:
 
 
 class AStarPlannerPolicy(PlannerPolicy):
-    def __init__(self, config: MlSpacesExpConfig, task: BaseMujocoTask | None = None) -> None:
+    def __init__(self, config: MlSpacesExpConfig, task: BaseMujocoTask) -> None:
         super().__init__(config, task)
 
         self._target_pos_quat = None
@@ -90,6 +90,18 @@ class AStarPlannerPolicy(PlannerPolicy):
         self._skipped_candidates = set()
         self._replan_after = None
         self.nav_planner.blacklist.clear()
+
+    @property
+    def retry_count(self) -> int:
+        return self.config.policy_config.plan_max_retries - self._retries_left
+
+    def get_phase(self) -> str:
+        return "unknown"
+
+    def get_all_phases(self) -> dict[str | int]:
+        return {
+            "unknown": 0,
+        }
 
     @property
     def candidate_objs(self) -> list[MlSpacesObject]:
@@ -220,7 +232,7 @@ class AStarPlannerPolicy(PlannerPolicy):
     def max_angle_waypoints(self, angles: np.ndarray) -> np.ndarray:
         assert angles.shape == (2, 1)
 
-        angle = float(abs(normalize_ang_error(angles[1] - angles[0])))
+        angle = float(abs(normalize_ang_error(angles[1] - angles[0])).squeeze())
         num_points = int(np.ceil(angle / self.config.policy_config.path_max_inter_waypoint_angle))
         if num_points <= 1:
             # Enofrce always at least one orientation correction

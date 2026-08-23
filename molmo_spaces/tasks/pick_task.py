@@ -1,17 +1,40 @@
 import logging
 from typing import Any
 
+import gymnasium.spaces as gyms
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 from molmo_spaces.configs.abstract_exp_config import MlSpacesExpConfig
-from molmo_spaces.env.abstract_sensors import SensorSuite
+from molmo_spaces.configs.task_configs import PickTaskConfig
+from molmo_spaces.env.abstract_sensors import Sensor, SensorSuite
 from molmo_spaces.env.data_views import MlSpacesObject
+from molmo_spaces.env.sensors import (
+    GraspStateSensor,
+    ObjectStartPoseSensor,
+    get_core_sensors,
+)
 from molmo_spaces.tasks.task import BaseMujocoTask
 from molmo_spaces.utils.mj_model_and_data_utils import descendant_geoms
 from molmo_spaces.utils.mujoco_scene_utils import get_supporting_geom
 
 log = logging.getLogger(__name__)
+
+
+class PickupObjGoalPoseSensor(Sensor):
+    """Sensor for target/end object pose in 7D format (x, y, z, qw, qx, qy, qz)."""
+
+    def __init__(self, uuid: str) -> None:
+        observation_space = gyms.Box(low=-np.inf, high=np.inf, shape=(7,), dtype=np.float32)
+        super().__init__(uuid=uuid, observation_space=observation_space)
+
+    def get_observation(self, env, task, batch_index: int = 0, *args, **kwargs) -> np.ndarray:
+        """Get target object pose."""
+        assert isinstance(task.config.task_config, PickTaskConfig), (
+            "PickupObjGoalPoseSensor requires a PickTaskConfig"
+        )
+        goal_pose = np.array(task.config.task_config.pickup_obj_goal_pose, dtype=np.float32)
+        return goal_pose
 
 
 class PickTask(BaseMujocoTask):
@@ -32,10 +55,23 @@ class PickTask(BaseMujocoTask):
         return task_objects
 
     def _create_sensor_suite_from_config(self, config: MlSpacesExpConfig) -> SensorSuite:
-        """Create a sensor suite from configuration using the centralized get_core_sensors function."""
-        from molmo_spaces.env.sensors import get_core_sensors
-
         sensors = get_core_sensors(config)
+
+        sensors.extend(
+            [
+                ObjectStartPoseSensor(
+                    object_name=config.task_config.pickup_obj_name, uuid="obj_start"
+                ),
+                GraspStateSensor(
+                    object_name=config.task_config.pickup_obj_name,
+                    uuid="grasp_state_pickup_obj",
+                ),
+                PickupObjGoalPoseSensor(
+                    uuid="obj_end",
+                ),
+            ]
+        )
+
         return SensorSuite(sensors)
 
     def judge_success(self) -> bool:

@@ -51,9 +51,11 @@ from __future__ import annotations
 import logging
 import os
 import stat
+from collections.abc import Iterable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from molmospaces_resources.manager import ResourceManager
@@ -71,10 +73,8 @@ def _force_unlink(path: Path) -> None:
     """``unlink`` that survives read-only files / missing files."""
     try:
         if path.is_file() or path.is_symlink():
-            try:
+            with suppress(OSError):
                 path.chmod(stat.S_IRUSR | stat.S_IWUSR)
-            except OSError:
-                pass
             path.unlink()
     except FileNotFoundError:
         pass
@@ -101,7 +101,7 @@ class SourceVerifyReport:
 
 
 def _iter_data_type_sources(
-    manager: "ResourceManager",
+    manager: ResourceManager,
     data_types: Iterable[str] | None,
 ) -> Iterable[tuple[str, str]]:
     versions = getattr(manager, "versions", {}) or {}
@@ -174,7 +174,7 @@ def _clear_partial_extract(
 
 
 def verify_resource_cache(
-    manager: "ResourceManager" | None = None,
+    manager: ResourceManager | None = None,
     data_types: Iterable[str] | None = None,
     *,
     dry_run: bool = False,
@@ -334,7 +334,7 @@ def find_robots_with_dangling_symlinks(robots_symlink_root: Path) -> list[str]:
     return broken
 
 
-def repair_robot_installs(manager: "ResourceManager", robot_names: list[str]) -> None:
+def repair_robot_installs(manager: ResourceManager, robot_names: list[str]) -> None:
     """Clear extract-complete flags and re-install listed robots (refreshes symlinks)."""
     for name in robot_names:
         try:

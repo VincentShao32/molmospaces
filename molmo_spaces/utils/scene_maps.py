@@ -454,6 +454,26 @@ class ProcTHORMap(THORMap):
         else:
             raise ValueError(f"Unsupported file format: {path}")
 
+    @staticmethod
+    def safe_model_data(spec, data=None) -> tuple[mujoco.MjModel, mujoco.MjData]:
+        # Delete bodies that match blacklisted asset UIDs (prevents compile errors)
+        _delete_blacklisted_bodies(spec)
+
+        # Create new model and data
+        try:
+            model = spec.compile()
+        except ValueError as e:
+            _handle_compile_error_and_blacklist(e)
+            raise
+        finally:
+            del spec  # Explicitly free the spec
+
+        if data is None:
+            data = mujoco.MjData(model)
+            mujoco.mj_forward(model, data)
+
+        return model, data
+
     @classmethod
     def from_mj_model_path(
         cls,
@@ -506,20 +526,7 @@ class ProcTHORMap(THORMap):
             log.debug(f"[ProcTHORMap] Deleting ceiling geom: {geom.name}")
             spec.delete(geom)  # for mujoco>3.3.5
 
-        # Delete bodies that match blacklisted asset UIDs (prevents compile errors)
-        _delete_blacklisted_bodies(spec)
-
-        try:
-            model: mujoco.MjModel = spec.compile()
-        except ValueError as e:
-            _handle_compile_error_and_blacklist(e)
-            raise
-        finally:
-            del spec  # Explicitly free the spec object
-
-        if data is None:
-            data = MjData(model)
-            mujoco.mj_forward(model, data)
+        model, data = cls.safe_model_data(spec, data)
 
         # Identify floor geom indices
         floor_ids = []
@@ -548,7 +555,9 @@ class ProcTHORMap(THORMap):
             root_body_id = root_body.id
             root_body_name = root_body.name
             if root_body_name and (
-                root_body_name.startswith("door_") or root_body_name.startswith("doorway_")
+                root_body_name.startswith("door_")
+                or root_body_name.startswith("doorway_")
+                or root_body_name.startswith("doorframe_")
             ):
                 if root_body_id not in parent_to_child:
                     parent_to_child[root_body_id] = []
@@ -733,106 +742,6 @@ class ProcTHORMap(THORMap):
         return instance
 
 
-class SceneFragmentMap(THORMap):
-    floor_polygon = None
-    scene_bbox = None
-
-    def __init__(
-        self,
-        occupancy_map_all_plane=None,
-        occupancy_map=None,
-        occupancy_scale_factor=None,
-        occupancy_world_dims=None,
-        voxel_map=None,
-        voxel_scale_factor=None,
-    ):
-        super().__init__(
-            occupancy_map,
-            occupancy_scale_factor,
-            occupancy_world_dims,
-            voxel_map,
-            voxel_scale_factor,
-        )
-        self._occupancy_map_all_plane = occupancy_map_all_plane
-
-    @property
-    def occupancy_map_all_plane(self):
-        # without convex hull assuming infintie plane
-        return self._occupancy_map_all_plane
-
-    # ruff demands these be commented out, as they are unused
-    # @property
-    # def floor_polygon(self):
-    #     return self._floor_polygon
-    #
-    # @property
-    # def scene_bbox(self):
-    #     return self._scene_bbox
-
-    def set_scene_bbox(self, scene_bbox):
-        raise NotImplementedError("Setting scene bbox is not implemented yet")
-
-    @classmethod
-    def from_orthographic_topdown_depth(
-        cls,
-        depth,
-        camera_info: dict = None,
-        map_type: str = "occupancy",
-        scale_to_world=False,
-        agent_radius=None,
-    ):
-        scale_factor = 1.0
-        if scale_to_world:
-            assert camera_info is not None, "camera_info is required to scale to world"
-            assert camera_info["pos"][0] == 0 and camera_info["pos"][1] == 0, (
-                "Camera must be at the center of the map"
-            )
-            h, w = depth.shape
-            # NOTE: https://github.com/google-deepmind/mujoco/blob/main/test/engine/testdata/vis_visualize/orthographic.xml
-            real_height = camera_info["fovy"]  # Mujoco definition
-            scale_factor = (real_height) / (h)
-            real_width = scale_factor * w
-            occupancy_world_dims = [real_width, real_height]
-
-        if map_type == "occupancy":
-            # if np.max(depth) > 255:
-            depth -= depth.min()
-            depth /= 2 * depth[depth <= 1].mean()
-            depth_pixels = 255 * np.clip(depth, 0, 1)
-            if np.isnan(depth_pixels).any():
-                print("Depth image contains NaN values")
-                return None
-
-            # 1: occupied. 0: free
-            intermediate_occupancy_mask = cls._get_occupancy_from_orthoview(cls, depth_pixels)
-            convex_hull_occupancy_mask = cls._get_freepace_from_orthoview(
-                cls, intermediate_occupancy_mask
-            )
-
-            # dilation (0s gets smaller) to account for agent radius
-            intermediate_occupancy_mask = cls._apply_buffer_with_agent_radius(
-                cls, intermediate_occupancy_mask, agent_radius, scale_factor
-            )
-            convex_hull_occupancy_mask = cls._apply_buffer_with_agent_radius(
-                cls, convex_hull_occupancy_mask, agent_radius, scale_factor
-            )
-
-            return cls(
-                occupancy_map_all_plane=intermediate_occupancy_mask,
-                occupancy_map=convex_hull_occupancy_mask,
-                occupancy_scale_factor=scale_factor,
-                occupancy_world_dims=occupancy_world_dims,
-            )
-        elif map_type == "voxel":
-            raise NotImplementedError("Voxel map is not implemented yet")
-        else:
-            raise ValueError(f"map_type must be one of {cls.MAP_TYPES}")
-
-    def save_map(self, path):
-        cv2.imwrite(path.replace(".png", "_all_plane.png"), self.occupancy_map_all_plane)
-        return super().save_map(path)
-
-
 class iTHORMap(ProcTHORMap):
     def __init__(
         self,
@@ -859,31 +768,66 @@ class iTHORMap(ProcTHORMap):
         device_id: int = None,
         use_filament: bool = False,
     ):
-        # Create a new model without ceiling bodies
+        # We make two passes of spec/model loading:
+        #  1. determine which objects are more than 1.5m above the floor
+        #  2. compute the occupancy map with high objects removed
+
+        # Pass 1.
+        spec = mujoco.MjSpec.from_file(model_path)
+        model, data = cls.safe_model_data(spec)
+
+        # Find floor geoms
+        floor_ids = []
+        for geom_id in range(model.ngeom):
+            geom_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id)
+            if geom_name and "floor" in geom_name.lower():
+                if model.geom(geom_id).contype == 0:  # is "__VISUAL_MJT__":
+                    floor_ids.append(geom_id)
+        assert len(floor_ids) > 0, "No floors found in the model"
+
+        # Compute top of floor and height threshold (1.5m above floor)
+        aabb_center, aabb_size = geom_aabb(model, data, floor_ids, tight_mesh=False)
+        z_threshold = 1.5 + (aabb_center[2] + aabb_size[2] / 2)  # floor top + 1.5
+
+        # Find top-level body names
+        high_names = set()
+        low_names = set()
+        for geom_id in range(model.ngeom):
+            aabb_center, aabb_size = geom_aabb(model, data, [geom_id], tight_mesh=False)
+            if model.geom(geom_id).contype == 0:  # is "__VISUAL_MJT__":
+                min_z = aabb_center[2] - aabb_size[2] / 2
+                body_id = model.geom_bodyid[geom_id]
+                body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id)
+
+                # Get top-level body name
+                parts = body_name.split("_")
+                parts[-2] = "0"
+                body_name = "_".join(parts)
+
+                if min_z > z_threshold:
+                    high_names.add(body_name)
+                else:
+                    low_names.add(body_name)
+
+        # If any low-level body is low, the top-level one cannot be considered high
+        high_names -= low_names
+
+        del data, model
+
+        # Pass 2.
         spec = mujoco.MjSpec.from_file(model_path)
 
-        # Collect bodies to delete first
+        # Delete high bodies
         for body in spec.worldbody.bodies:
             body_name = body.name
             if body_name and "ceiling" in body_name.lower():
                 spec.delete(body)
             elif body_name and "light" in body_name.lower():
                 spec.delete(body)
+            elif body_name in high_names:
+                spec.delete(body)
 
-        # Delete bodies that match blacklisted asset UIDs (prevents compile errors)
-        _delete_blacklisted_bodies(spec)
-
-        # Create new model and data
-        try:
-            model = spec.compile()
-        except ValueError as e:
-            _handle_compile_error_and_blacklist(e)
-            raise
-        finally:
-            del spec  # Explicitly free the spec
-
-        data = mujoco.MjData(model)
-        mujoco.mj_forward(model, data)
+        model, data = cls.safe_model_data(spec)
 
         floor_ids = []
         for geom_id in range(model.ngeom):

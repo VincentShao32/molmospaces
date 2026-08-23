@@ -7,6 +7,7 @@ for use in the data generation pipeline.
 
 import math
 import random
+from functools import cache
 from pathlib import Path
 
 from molmo_spaces.configs import BasePolicyConfig, BaseRobotConfig
@@ -56,7 +57,7 @@ from molmo_spaces.configs.task_sampler_configs import (
 # Oder of configs should be order the code is executed in
 # scenes, robots, camera, task_sampler, policy, output
 from molmo_spaces.data_generation.config_registry import register_config
-from molmo_spaces.molmo_spaces_constants import ASSETS_DIR, get_robot_paths
+from molmo_spaces.molmo_spaces_constants import ASSETS_DIR, get_robot_path
 from molmo_spaces.tasks.opening_task_samplers import OpenTaskSampler
 from molmo_spaces.tasks.pick_and_place_color_task_sampler import PickAndPlaceColorTaskSampler
 from molmo_spaces.tasks.pick_and_place_next_to_task_sampler import PickAndPlaceNextToTaskSampler
@@ -92,7 +93,9 @@ class FrankaPickPointTrackDebug(PickBaseConfig):
     use_filament: bool = False
 
     robot_config: BaseRobotConfig = FrankaRobotConfig()
-    camera_config: FrankaOmniPurposeCameraSystem = FrankaOmniPurposeCameraSystem()
+    camera_config: FrankaOmniPurposeCameraSystem = FrankaOmniPurposeCameraSystem(
+        img_resolution=(1024, 576)
+    )
     output_dir: Path = ASSETS_DIR / "experiment_output" / "datagen" / "pick_point_track"
     task_sampler_config: PickTaskSamplerConfig = PickTaskSamplerConfig(
         task_sampler_class=PickTaskSampler,
@@ -156,7 +159,9 @@ class FrankaPickAndPlacePointTrack(PickAndPlaceDataGenConfig):
     scene_dataset: str = "procthor-10k"
     data_split: str = "train"
     robot_config: BaseRobotConfig = FrankaRobotConfig()
-    camera_config: FrankaOmniPurposeCameraSystem = FrankaOmniPurposeCameraSystem()
+    camera_config: FrankaOmniPurposeCameraSystem = FrankaOmniPurposeCameraSystem(
+        img_resolution=(1024, 576)
+    )
     output_dir: Path = ASSETS_DIR / "experiment_output" / "datagen" / "pick_and_place_point_track"
     task_sampler_config: PickAndPlaceTaskSamplerConfig = PickAndPlaceTaskSamplerConfig(
         task_sampler_class=PickAndPlaceTaskSampler,
@@ -183,7 +188,9 @@ class CoTracker3Eval(PickBaseConfig):
 
     scene_dataset: str = "procthor-objaverse"
     robot_config: BaseRobotConfig = FrankaRobotConfig()
-    camera_config: FrankaOmniPurposeCameraSystem = FrankaOmniPurposeCameraSystem()
+    camera_config: FrankaOmniPurposeCameraSystem = FrankaOmniPurposeCameraSystem(
+        img_resolution=(1024, 576)
+    )
     output_dir: Path = Path("/gpfs/scrubbed/yunbos/video_datasets/cotracker3-eval-datasets/molmospaces")
     task_sampler_config: PickTaskSamplerConfig = PickTaskSamplerConfig(
         task_sampler_class=PickTaskSampler,
@@ -406,8 +413,7 @@ class RBY1OpenDataGenConfig(OpeningBaseConfig):
             CuroboOpenClosePlannerPolicy,
         )
 
-        rby1_path = get_robot_paths().get("rby1m")
-        assert rby1_path is not None, "RBY1 robot path not found"
+        rby1_path = get_robot_path("rby1m")
 
         left_curobo_planner_config = CuroboPlannerConfig(
             curobo_robot_config_path=str(
@@ -428,6 +434,7 @@ class RBY1OpenDataGenConfig(OpeningBaseConfig):
         )
         return CuroboOpenClosePlannerPolicyConfig(
             policy_cls=CuroboOpenClosePlannerPolicy,
+            policy_factory=CuroboOpenClosePlannerPolicy,
             left_curobo_planner_config=left_curobo_planner_config,
             right_curobo_planner_config=right_curobo_planner_config,
         )
@@ -461,8 +468,7 @@ class RBY1PickAndPlaceDataGenConfig(PickAndPlaceDataGenConfig):
             CuroboPickAndPlacePlannerPolicy,
         )
 
-        rby1_path = get_robot_paths().get("rby1m")
-        assert rby1_path is not None, "RBY1 robot path not found"
+        rby1_path = get_robot_path("rby1m")
         from molmo_spaces.planner.curobo_planner import CuroboPlannerConfig
 
         left_curobo_planner_config = CuroboPlannerConfig(
@@ -484,6 +490,7 @@ class RBY1PickAndPlaceDataGenConfig(PickAndPlaceDataGenConfig):
         )
         return CuroboPickAndPlacePlannerPolicyConfig(
             policy_cls=CuroboPickAndPlacePlannerPolicy,
+            policy_factory=CuroboPickAndPlacePlannerPolicy,
             left_curobo_planner_config=left_curobo_planner_config,
             right_curobo_planner_config=right_curobo_planner_config,
             enable_collision_avoidance=True,
@@ -538,8 +545,7 @@ class RBY1PickDataGenConfig(PickBaseConfig):
             CuroboPickAndPlacePlannerPolicy,
         )
 
-        rby1_path = get_robot_paths().get("rby1m")
-        assert rby1_path is not None, "RBY1 robot path not found"
+        rby1_path = get_robot_path("rby1m")
         from molmo_spaces.planner.curobo_planner import CuroboPlannerConfig
 
         left_curobo_planner_config = CuroboPlannerConfig(
@@ -561,6 +567,7 @@ class RBY1PickDataGenConfig(PickBaseConfig):
         )
         return CuroboPickAndPlacePlannerPolicyConfig(
             policy_cls=CuroboPickAndPlacePlannerPolicy,
+            policy_factory=CuroboPickAndPlacePlannerPolicy,
             left_curobo_planner_config=left_curobo_planner_config,
             right_curobo_planner_config=right_curobo_planner_config,
             enable_collision_avoidance=True,
@@ -725,10 +732,20 @@ class FrankaPickOmniCamAblationConfig(FrankaPickOmniCamConfig):
 
     task_sampler_config: PickTaskSamplerConfig = PickTaskSamplerConfig(
         task_sampler_class=PickTaskSampler,
-        added_pickup_objects=get_valid_pickupable_obja_uids(),
+        added_pickup_objects=None,  # will get set after instantiation
         # num_added_pickups=30, these are defaults
         # episodes_per_added_pickup=1,
     )
+
+    @staticmethod
+    @cache
+    def _get_valid_pickupable_obja_uids() -> list[str]:
+        return get_valid_pickupable_obja_uids()
+
+    def model_post_init(self, __context) -> None:
+        super().model_post_init(__context)
+        if self.task_sampler_config.added_pickup_objects is None:
+            self.task_sampler_config.added_pickup_objects = self._get_valid_pickupable_obja_uids()
 
     @property
     def tag(self) -> str:
@@ -1046,3 +1063,29 @@ class RUMPickAndPlaceMultiDataGenConfig(PickAndPlaceDataGenConfig):
     @property
     def tag(self) -> str:
         return "pnpmulti_bench"
+
+
+@register_config("FrankaPickBatchTestConfig")
+class FrankaPickBatchTestConfig(PickBaseConfig):
+    """Minimal config to test local batch-based work distribution.
+
+    Single house, 12 episodes split into 3 batches of 4, processed by 2 workers.
+    Output: house_7/trajectories_batch_{1,2,3}_of_3.h5
+    """
+
+    num_workers: int = 2
+    robot_config: BaseRobotConfig = FrankaRobotConfig()
+    camera_config: FrankaDroidCameraSystem = FrankaDroidCameraSystem()
+    task_sampler_config: PickTaskSamplerConfig = PickTaskSamplerConfig(
+        task_sampler_class=PickTaskSampler,
+        house_inds=[7],
+        samples_per_house=12,
+        episodes_per_batch=4,  # 4 is the default value - change to 1 or 10 to test different batch sizes.
+    )
+    filter_for_successful_trajectories: bool = True
+    output_dir: Path = ASSETS_DIR / "experiment_output" / "datagen" / "pick_batch_test"
+    log_level: str = "debug"
+
+    @property
+    def tag(self) -> str:
+        return "franka_pick_batch_test"

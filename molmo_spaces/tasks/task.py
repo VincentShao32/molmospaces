@@ -39,7 +39,6 @@ class BaseMujocoTask(ABC):
         self,
         env: BaseMujocoEnv,
         exp_config: "MlSpacesExpConfig",
-        sensor_suite: SensorSuite | None = None,
     ) -> None:
         self._env = env
         self._ctrl_dt_ms = exp_config.ctrl_dt_ms
@@ -60,10 +59,11 @@ class BaseMujocoTask(ABC):
         self.viewer = None  # placeholder to attach interactive viewer
         self.frozen_config = None
 
-        # TODO(rose): disallow passing in sensor suite OR switch to just doing that. probably the latter
-        if sensor_suite is None and exp_config.task_config.use_sensors:
-            sensor_suite = self._create_sensor_suite_from_config(exp_config)
-        self._sensor_suite = sensor_suite
+        if exp_config.task_config.use_sensors:
+            self._sensor_suite = self._create_sensor_suite_from_config(exp_config)
+            self._sensor_suite.extend(self._env.current_robot.create_robot_sensors())
+        else:
+            self._sensor_suite = None
 
         # Action tracking for ActionSensors - the most recent action dict
         self.last_action: dict[str, Any] | None = None
@@ -161,14 +161,25 @@ class BaseMujocoTask(ABC):
 
         return objects
 
+    @abstractmethod
     def _create_sensor_suite_from_config(self, exp_config) -> SensorSuite:
-        # TODO(rose): probably have this api and then move the usage out of the class - do it later though
+        """
+        Create a sensor suite with task-specific sensors.
+        Robot-specific sensors should not be added here.
+        """
         raise NotImplementedError
 
     def register_policy(self, policy: "BasePolicy") -> None:
-        """Register a policy with the task for completion tracking and phase sensing."""
+        """
+        Register a policy with the task for completion tracking and phase sensing.
+        This should only be called once in the task's lifetime.
+        """
+        if self._registered_policy is not None:
+            raise ValueError("Policy already registered")
         self._registered_policy = policy
         policy.task = self
+        if self._sensor_suite is not None:
+            self._sensor_suite.extend(policy.create_policy_sensors())
 
     def num_steps_taken(self) -> int:
         """Get the number of steps taken in the current episode."""
@@ -320,8 +331,15 @@ class BaseMujocoTask(ABC):
             # Return current state without stepping
             return self.get_and_cache_all_step_information()
 
+        self._apply_action(actions)
+        return self._observe_and_cache()
+
+    def _apply_action(self, action: dict[str, Any] | list[dict[str, Any]]) -> None:
+        """Apply one action and advance the simulation, without polling sensors."""
+        actions = [action] if isinstance(action, dict) else action
+
         # Check if any action contains a "done" signal
-        for _i, act in enumerate(actions):
+        for act in actions:
             if isinstance(act, dict) and act.get("done", False):
                 act.pop("done")
                 self._done_action_received = True
@@ -329,8 +347,8 @@ class BaseMujocoTask(ABC):
         # Update episode step count
         self.episode_step_count += 1
 
-        for robot, action in zip(self._env.robots, actions, strict=True):
-            robot.update_control(action)
+        for robot, act in zip(self._env.robots, actions, strict=True):
+            robot.update_control(act)
 
         # Physics step (MuJoCo simulation)
         if self._datagen_profiler is not None:
@@ -345,7 +363,12 @@ class BaseMujocoTask(ABC):
         # Store the action for env 0 for ActionSensors
         self.last_action = actions[0] if actions else None
 
-        # Sensor polling (cameras, proprioception, etc.)
+    def _observe_and_cache(
+        self,
+    ) -> tuple[
+        list[dict[str, Any]], NDArray[float], NDArray[bool], NDArray[bool], list[dict[str, Any]]
+    ]:
+        """Poll the sensor suite and record the resulting step."""
         if self._datagen_profiler is not None:
             self._datagen_profiler.start("sensor_polling")
         observation, reward, terminated, truncated, info = self.get_and_cache_all_step_information()
@@ -360,6 +383,37 @@ class BaseMujocoTask(ABC):
         self.action_cache.append(self.last_action)
 
         return observation, reward, terminated, truncated, info
+
+    def step_chunk(
+        self,
+        action_chunk: list[dict[str, Any] | list[dict[str, Any]]],
+        stop_on_success: bool = False,
+    ) -> tuple[
+        list[dict[str, Any]], NDArray[float], NDArray[bool], NDArray[bool], list[dict[str, Any]]
+    ]:
+        """Step a chunk of actions, polling sensors only after the last one.
+
+        An approximation of real-time action chunking: the chunk runs open-loop.
+        Could take ``obs_on_action: int = None`` to also return an intermediate
+        observation.
+
+        Args:
+            action_chunk: Actions to apply in order. Each one is a single action
+                dict for single-env mode, or a list of action dicts for batched mode.
+            stop_on_success: End the chunk once the success criterion is met.
+
+        Returns:
+            Tuple of (observations, rewards, terminated, truncated, infos)
+        """
+        if not action_chunk:
+            raise ValueError("step_chunk requires at least one action")
+
+        for action in action_chunk[:-1]:
+            self._apply_action(action)
+            if np.all(self.is_done()) or (stop_on_success and self.judge_success()):
+                return self._observe_and_cache()
+
+        return self.step(action_chunk[-1])
 
     def is_done(self) -> NDArray[bool]:
         return np.logical_or(self.is_terminal(), self.is_timed_out())
@@ -441,8 +495,12 @@ class BaseMujocoTask(ABC):
             "referral_expressions": self.get_referral_expressions(),
         }
         if self._registered_policy is not None:
-            phases_dict = self._registered_policy.get_all_phases()
-            obs_scene["policy_phases"] = phases_dict
+            from molmo_spaces.policy.base_policy import PlannerPolicy
+
+            # A bit of a hack - why do we need phases in the obs_scene?
+            if isinstance(self._registered_policy, PlannerPolicy):
+                phases_dict = self._registered_policy.get_all_phases()
+                obs_scene["policy_phases"] = phases_dict
             obs_scene.update(self._registered_policy.get_info())
 
         if self.frozen_config is not None:
@@ -465,6 +523,24 @@ class BaseMujocoTask(ABC):
         history["obs_scene"] = self.get_obs_scene()
 
         return history
+
+    def render(self, camera_name: str | None = None) -> np.ndarray:
+        """Render the current scene as an RGB array.
+
+        Args:
+            camera_name: Camera to render from; defaults to the first camera in
+                the camera config.
+        """
+        if camera_name is None:
+            camera_config = self.config.camera_config
+            if camera_config is None or not camera_config.cameras:
+                raise RuntimeError(
+                    "Cannot render: no cameras configured. Set exp_config.camera_config "
+                    "or pass camera_name."
+                )
+            camera_name = camera_config.cameras[0].name
+
+        return self._env.render_rgb_frame(camera_name)
 
     def close(self):
         # Clear any MlSpacesObject references

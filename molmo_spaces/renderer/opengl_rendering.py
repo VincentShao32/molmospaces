@@ -1,3 +1,4 @@
+import sys
 from queue import Queue
 from typing import Any, Literal
 
@@ -74,6 +75,7 @@ class MjOpenGLRenderer(MjAbstractRenderer):
           max_geom: Optional integer specifying the maximum number of geoms that can
             be rendered in the same scene. If None this will be chosen automatically
             based on the estimated maximum number of renderable geoms in the model_bindings.
+
         Raises:
           ValueError: If `camera_id` is outside the valid range, or if `width` or
             `height` exceed the dimensions of MuJoCo's offscreen framebuffer.
@@ -113,7 +115,7 @@ class MjOpenGLRenderer(MjAbstractRenderer):
             from mujoco import gl_context
 
             self._gl_context = gl_context.GLContext(width, height)  # type: ignore
-            self._context_is_cgl = True
+            self._context_is_cgl = sys.platform == "darwin"
         else:
             from molmo_spaces.renderer.opengl_context import EGLGLContext
 

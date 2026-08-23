@@ -54,6 +54,7 @@ class FrankaPickDroidTestConfig(FrankaPickDroidDataGenConfig):
         super().model_post_init(__context)
 
         self.policy_config.policy_cls = PickPlannerPolicy
+        self.policy_config.policy_factory = PickPlannerPolicy
 
         # Override house to use for testing (use house 8, the default)
         self.task_sampler_config.house_inds = [8]
@@ -79,6 +80,8 @@ class FrankaPickDroidTestConfig(FrankaPickDroidDataGenConfig):
         # Disable action noise
         self.robot_config.action_noise_config.enabled = False
 
+        self.camera_config.img_resolution = (624, 352)  # reset to test-data defaults
+
 
 class FrankaPickRandomizedTestConfig(FrankaPickRandomizedDataGenConfig):
     """Test configuration for Franka pick with randomized cameras - disables randomization for deterministic tests."""
@@ -88,6 +91,7 @@ class FrankaPickRandomizedTestConfig(FrankaPickRandomizedDataGenConfig):
         super().model_post_init(__context)
 
         self.policy_config.policy_cls = PickPlannerPolicy
+        self.policy_config.policy_factory = PickPlannerPolicy
 
         # Override house to use for testing (use house 8, the default)
         self.task_sampler_config.house_inds = [8]
@@ -114,6 +118,8 @@ class FrankaPickRandomizedTestConfig(FrankaPickRandomizedDataGenConfig):
 
         # Disable action noise
         self.robot_config.action_noise_config.enabled = False
+
+        self.camera_config.img_resolution = (624, 352)  # reset to test-data defaults
 
 
 class FrankaPickAndPlaceDroidTestConfig(FrankaPickAndPlaceDroidDataGenConfig):
@@ -130,7 +136,7 @@ class FrankaPickAndPlaceDroidTestConfig(FrankaPickAndPlaceDroidDataGenConfig):
         self.policy_config.place_z_offset = 0.02  # lower the lift pose so its not out of reach
 
         # Set fixed seed and task horizon for deterministic tests
-        self.seed = 1
+        self.seed = 2
         self.task_horizon = 6
 
         self.filter_for_successful_trajectories = False
@@ -145,6 +151,8 @@ class FrankaPickAndPlaceDroidTestConfig(FrankaPickAndPlaceDroidDataGenConfig):
 
         # Disable action noise
         self.robot_config.action_noise_config.enabled = False
+
+        self.camera_config.img_resolution = (624, 352)  # reset to test-data defaults
 
 
 class FrankaPickAndPlaceGoProD405D455TestConfig(FrankaPickAndPlaceDroidDataGenConfig):
@@ -165,7 +173,7 @@ class FrankaPickAndPlaceGoProD405D455TestConfig(FrankaPickAndPlaceDroidDataGenCo
         self.policy_config.place_z_offset = 0.02  # lower the lift pose so its not out of reach
 
         # Set fixed seed and task horizon for deterministic tests
-        self.seed = 14
+        self.seed = 1
         self.task_horizon = 6
 
         self.filter_for_successful_trajectories = False
@@ -280,6 +288,8 @@ class RUMOpenTestConfig(OpeningBaseConfig):
         self.policy_config.grasp_vertical_cost_weight = 0.0
         self.policy_config.grasp_com_dist_cost_weight = 0.0
 
+        self.camera_config.img_resolution = (624, 352)  # reset to test-data defaults
+
 
 class RUMCloseTestConfig(OpeningBaseConfig):
     """Test configuration for RUM close task - disables randomization for deterministic tests."""
@@ -299,6 +309,7 @@ class RUMCloseTestConfig(OpeningBaseConfig):
         # Set task type to close
         self.task_type = "close"
         self.task_sampler_config.target_initial_state_open_percentage = 0.5
+        self.camera_config.img_resolution = (624, 352)  # reset to test-data defaults
 
         # Use iTHOR for testing instead of ProcTHOR
         self.scene_dataset = "ithor"
