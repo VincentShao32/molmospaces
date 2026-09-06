@@ -46,6 +46,12 @@ class MixtureComponent:
             ``point_track_background_fraction`` field (``[0, 1]``). Ignored
             unless background sampling is enabled. ``None`` keeps the
             sub-config default.
+        point_track_use_kubric_sampling: Optional override for the sub-config's
+            Kubric space-time/per-segment sampler toggle. ``None`` keeps the
+            sub-config default.
+        point_track_align_across_cameras: Optional override for pooling Kubric
+            candidates across cameras and projecting one shared point set into
+            every view. ``None`` keeps the sub-config default.
         scene_dataset: Optional override for the sub-config's ``scene_dataset``
             string (e.g. ``"procthor-10k"``). ``None`` keeps the sub-config
             default.
@@ -59,6 +65,8 @@ class MixtureComponent:
     point_track_num_points: int | None = None
     point_track_include_background: bool | None = None
     point_track_background_fraction: float | None = None
+    point_track_use_kubric_sampling: bool | None = None
+    point_track_align_across_cameras: bool | None = None
     scene_dataset: str | None = None
     data_split: str | None = None
 
@@ -134,9 +142,7 @@ def register_mixture(name: str, *, strict: bool = True):
 
 def get_mixture(name: str) -> MixtureSpec:
     if name not in _MIXTURE_REGISTRY:
-        raise ValueError(
-            f"Mixture '{name}' not found. Available mixtures: {list_mixtures()}"
-        )
+        raise ValueError(f"Mixture '{name}' not found. Available mixtures: {list_mixtures()}")
     return _MIXTURE_REGISTRY[name]()
 
 

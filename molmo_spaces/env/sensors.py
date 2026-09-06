@@ -1019,7 +1019,6 @@ def get_core_sensors(exp_config):
 
     if pt_only:
         sensors.append(RobotJointPositionSensor(uuid="qpos", max_joints=9))
-        sensors.append(TCPPoseSensor(uuid="tcp_pose"))
         return sensors
 
     # Robot State sensors

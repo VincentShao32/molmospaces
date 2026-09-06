@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import mujoco
+import numpy as np
 
 # import mujoco.viewer
 import psutil
@@ -31,11 +32,16 @@ from molmo_spaces.utils.mp_logging import (
     worker_stdout_context,
 )
 from molmo_spaces.utils.point_tracking_utils import (
+    RASTER_VISIBILITY_METHOD,
     _build_camera_matrices,
+    get_kubric_segment_ids,
     get_trackable_body_ids,
     sample_from_image,
+    sample_kubric_candidates_from_image,
     sample_mesh_vertices,
     save_point_tracks,
+    select_kubric_candidate_indices,
+    select_unambiguous_kubric_candidate_indices,
     track_points_for_frame,
 )
 from molmo_spaces.utils.profiler_utils import DatagenProfiler, Profiler
@@ -44,6 +50,8 @@ from molmo_spaces.utils.save_utils import (
     save_trajectories,
     save_videos_from_raw_observations,
 )
+
+log = logging.getLogger(__name__)
 
 # Set multiprocessing context based on CUDA availability
 # forkserver is safer for CUDA, spawn for fallback
@@ -54,20 +62,14 @@ logging.getLogger("curobo").setLevel(logging.WARNING)
 logging.getLogger("trimesh").setLevel(logging.WARNING)
 
 
-import numpy as np
-
-
 class _BodyPoseSnapshot:
     """Lightweight stand-in for MjData exposing only xpos/xmat from stored arrays."""
+
     __slots__ = ("xpos", "xmat")
 
     def __init__(self, xpos: np.ndarray, xmat: np.ndarray):
         self.xpos = xpos
         self.xmat = xmat
-
-
-def _make_mock_data(xpos: np.ndarray, xmat: np.ndarray) -> _BodyPoseSnapshot:
-    return _BodyPoseSnapshot(xpos, xmat)
 
 
 def get_process_memory():
@@ -281,10 +283,7 @@ def save_house_trajectories(
             pt_data = episode_info.pop("point_track_data", None)
             if pt_data:
                 for cam_name, cam_tracks in pt_data.items():
-                    npz_path = (
-                        house_output_dir
-                        / f"episode_{idx:08d}_{cam_name}_point_tracks.npz"
-                    )
+                    npz_path = house_output_dir / f"episode_{idx:08d}_{cam_name}_point_tracks.npz"
                     save_point_tracks(
                         save_path=npz_path,
                         trajs_2d=cam_tracks["trajs_2d"],
@@ -295,6 +294,22 @@ def save_house_trajectories(
                         intrinsics=cam_tracks["intrinsics"],
                         total_mesh_verts=cam_tracks["total_mesh_verts"],
                         query_frames=cam_tracks.get("query_frames"),
+                        query_points=cam_tracks.get("query_points"),
+                        sampling_method=cam_tracks.get("sampling_method"),
+                        sampling_stride=cam_tracks.get("sampling_stride"),
+                        sampling_phase=cam_tracks.get("sampling_phase"),
+                        max_sampled_fraction=cam_tracks.get("max_sampled_fraction"),
+                        segment_ids=cam_tracks.get("segment_ids"),
+                        track_ids=cam_tracks.get("track_ids"),
+                        aligned_across_cameras=cam_tracks.get("aligned_across_cameras"),
+                        query_source_cameras=cam_tracks.get("query_source_cameras"),
+                        geom_ids=cam_tracks.get("geom_ids"),
+                        visibility_method=cam_tracks.get("visibility_method"),
+                        in_frame=cam_tracks.get("in_frame"),
+                        raster_ambiguous=cam_tracks.get("raster_ambiguous"),
+                        exclude_raster_ambiguous=cam_tracks.get("exclude_raster_ambiguous"),
+                        visibility_filter_stats=cam_tracks.get("visibility_filter_stats"),
+                        visibility_check_cameras=cam_tracks.get("visibility_check_cameras"),
                     )
                 worker_logger.info(
                     f"Saved point tracks for episode {idx} "
@@ -809,17 +824,34 @@ class ParallelRolloutRunner:
             datagen_profiler.end("rollout_reset")
 
         # Point tracking setup
-        do_point_tracking = (
-            exp_config is not None
-            and getattr(exp_config, "generate_point_tracks", False)
+        do_point_tracking = getattr(exp_config, "generate_point_tracks", False)
+        pt_sampling = getattr(exp_config, "point_track_sampling", "vertex")
+        pt_query_interval = getattr(exp_config, "point_track_query_interval", 0)
+        pt_image_stride = max(1, int(getattr(exp_config, "point_track_image_stride", 1)))
+        pt_use_kubric_sampling = bool(getattr(exp_config, "point_track_use_kubric_sampling", False))
+        if pt_use_kubric_sampling and pt_sampling != "image":
+            raise ValueError(
+                "point_track_use_kubric_sampling requires point_track_sampling='image'"
+            )
+        pt_exclude_raster_ambiguous = pt_use_kubric_sampling and bool(
+            getattr(exp_config, "point_track_exclude_raster_ambiguous", True)
         )
-        pt_sampling = getattr(exp_config, "point_track_sampling", "vertex") if exp_config else "vertex"
-        pt_query_interval = getattr(exp_config, "point_track_query_interval", 0) if exp_config else 0
-        pt_image_stride = (
-            max(1, int(getattr(exp_config, "point_track_image_stride", 1)))
-            if exp_config
-            else 1
+        pt_max_rejection_rounds = int(
+            getattr(exp_config, "point_track_visibility_max_rejection_rounds", 32)
         )
+        pt_kubric_stride = max(1, int(getattr(exp_config, "point_track_kubric_sampling_stride", 4)))
+        pt_kubric_max_sampled_fraction = float(
+            getattr(exp_config, "point_track_kubric_max_sampled_fraction", 0.1)
+        )
+        if not 0.0 <= pt_kubric_max_sampled_fraction <= 1.0:
+            raise ValueError("point_track_kubric_max_sampled_fraction must be in [0, 1]")
+        pt_align_across_cameras = bool(
+            getattr(exp_config, "point_track_align_across_cameras", False)
+        )
+        if pt_align_across_cameras and not pt_use_kubric_sampling:
+            raise ValueError(
+                "point_track_align_across_cameras requires point_track_use_kubric_sampling=True"
+            )
         pt_local_coords = None
         pt_body_ids = None
         pt_initial_world = None
@@ -829,20 +861,22 @@ class ParallelRolloutRunner:
         pt_stored_body_xpos: list[np.ndarray] = []
         pt_stored_body_xmat: list[np.ndarray] = []
         pt_stored_depths: dict[str, list[np.ndarray]] = {}
+        # Only the exact-geom channel is needed for replay, not the full HxWx3
+        # segmentation. Keep one int32 raster per camera/recorded video frame.
+        pt_stored_geom_maps: dict[str, list[np.ndarray]] = {}
         pt_stored_cam_matrices: dict[str, list[tuple[np.ndarray, np.ndarray]]] = {}
         pt_preview_mode = False
 
         if do_point_tracking:
-            import numpy as np
-
             env = task.env
             img_w, img_h = (624, 352)
             if exp_config.camera_config is not None:
                 img_w, img_h = exp_config.camera_config.img_resolution
 
             total_budget = exp_config.point_track_num_points
-            pt_preview_mode = pt_query_interval > 0 and pt_sampling == "image"
-
+            pt_preview_mode = pt_sampling == "image" and (
+                pt_query_interval > 0 or pt_use_kubric_sampling
+            )
             if pt_sampling == "vertex":
                 local_coords, body_ids, world_coords, total_verts = sample_mesh_vertices(
                     env.mj_model,
@@ -871,7 +905,19 @@ class ParallelRolloutRunner:
                 pt_bg_fraction: float = float(
                     getattr(exp_config, "point_track_background_fraction", 0.0)
                 )
-                for cam_cfg in exp_config.camera_config.cameras:
+                pt_include_background = bool(
+                    getattr(exp_config, "point_track_include_background", False)
+                )
+                for camera_index, cam_cfg in enumerate(exp_config.camera_config.cameras):
+                    if pt_use_kubric_sampling:
+                        phase_rng = np.random.RandomState(
+                            episode_seed + 4242 + (0 if pt_align_across_cameras else camera_index)
+                        )
+                        kubric_phase = tuple(
+                            int(v) for v in phase_rng.randint(0, pt_kubric_stride, size=3)
+                        )
+                    else:
+                        kubric_phase = (0, 0, 0)
                     cam_entry = {
                         "trajs_2d": [],
                         "visibility": [],
@@ -880,6 +926,28 @@ class ParallelRolloutRunner:
                         "img_w": img_w,
                         "img_h": img_h,
                         "query_frames": [],
+                        "query_points": None,
+                        "sampling_method": (
+                            "kubric"
+                            if pt_use_kubric_sampling
+                            else ("image" if pt_sampling == "image" else "vertex")
+                        ),
+                        "sampling_stride": (
+                            pt_kubric_stride
+                            if pt_use_kubric_sampling
+                            else (pt_image_stride if pt_sampling == "image" else 0)
+                        ),
+                        "max_sampled_fraction": (
+                            pt_kubric_max_sampled_fraction if pt_use_kubric_sampling else None
+                        ),
+                        "_sampling_seed": (
+                            episode_seed + 9999 + (0 if pt_align_across_cameras else camera_index)
+                        ),
+                        "sampling_phase": (
+                            np.asarray(kubric_phase, dtype=np.int32)
+                            if pt_use_kubric_sampling
+                            else None
+                        ),
                     }
                     if pt_sampling == "image" and not pt_preview_mode:
                         cam_name = cam_cfg.name
@@ -888,8 +956,13 @@ class ParallelRolloutRunner:
                             depth = env.render_depth_frame(cam_name)
                             seg = env.render_segmentation_frame(cam_name)
                             lc, bi, wc, tv = sample_from_image(
-                                env.mj_model, env.current_data,
-                                camera, img_w, img_h, depth, seg,
+                                env.mj_model,
+                                env.current_data,
+                                camera,
+                                img_w,
+                                img_h,
+                                depth,
+                                seg,
                                 max_points=total_budget,
                                 seed=episode_seed,
                                 object_body_ids=obj_bids,
@@ -905,6 +978,14 @@ class ParallelRolloutRunner:
                     if pt_preview_mode:
                         cam_entry["_candidates_lc"] = []
                         cam_entry["_candidates_bi"] = []
+                        if pt_use_kubric_sampling:
+                            cam_entry["_candidates_geom_ids"] = []
+                            cam_entry["in_frame"] = []
+                            cam_entry["raster_ambiguous"] = []
+                            cam_entry["visibility_method"] = RASTER_VISIBILITY_METHOD
+                            cam_entry["_candidates_world"] = []
+                            cam_entry["_candidates_query_points"] = []
+                            cam_entry["_candidates_segment_ids"] = []
                     pt_per_camera[cam_cfg.name] = cam_entry
 
         # Record initial tracking frame (matches the video frame from task.reset())
@@ -924,34 +1005,85 @@ class ParallelRolloutRunner:
                     if cam_name not in pt_stored_cam_matrices:
                         pt_stored_cam_matrices[cam_name] = []
                     pt_stored_depths[cam_name].append(depth.copy())
-                    w2c, intr = _build_camera_matrices(
-                        camera, cam_data["img_w"], cam_data["img_h"]
-                    )
+                    w2c, intr = _build_camera_matrices(camera, cam_data["img_w"], cam_data["img_h"])
                     pt_stored_cam_matrices[cam_name].append((w2c.copy(), intr.copy()))
                     cam_data["intrinsics"] = intr.copy()
-                    seg = env.render_segmentation_frame(cam_name)
-                    cand_lc, cand_bi, _, _ = sample_from_image(
-                        env.mj_model, env.current_data,
-                        camera, cam_data["img_w"], cam_data["img_h"],
-                        depth, seg,
-                        max_points=total_budget,
-                        seed=episode_seed,
-                        object_body_ids=obj_bids,
-                        background_body_ids=pt_bg_bids,
-                        background_fraction=pt_bg_fraction,
-                        image_stride=pt_image_stride,
-                    )
-                    if len(cand_lc) > 0:
-                        cam_data["_candidates_lc"].append(cand_lc)
-                        cam_data["_candidates_bi"].append(cand_bi)
+                    seg = None
+                    if pt_use_kubric_sampling:
+                        seg = env.render_segmentation_frame(cam_name)
+                        pt_stored_geom_maps[cam_name] = [
+                            np.array(seg[:, :, 0], dtype=np.int32, copy=True)
+                        ]
+                    should_sample = not pt_use_kubric_sampling or cam_data["sampling_phase"][0] == 0
+                    if should_sample:
+                        if seg is None:
+                            seg = env.render_segmentation_frame(cam_name)
+                        if pt_use_kubric_sampling:
+                            cand_lc, cand_bi, cand_world, cand_query = (
+                                sample_kubric_candidates_from_image(
+                                    env.mj_model,
+                                    env.current_data,
+                                    camera,
+                                    cam_data["img_w"],
+                                    cam_data["img_h"],
+                                    depth,
+                                    seg,
+                                    frame_index=0,
+                                    sampling_stride=pt_kubric_stride,
+                                    spatial_phase=cam_data["sampling_phase"][1:],
+                                    object_body_ids=obj_bids,
+                                    include_background=pt_include_background,
+                                )
+                            )
+                        else:
+                            cand_lc, cand_bi, _, _ = sample_from_image(
+                                env.mj_model,
+                                env.current_data,
+                                camera,
+                                cam_data["img_w"],
+                                cam_data["img_h"],
+                                depth,
+                                seg,
+                                max_points=total_budget,
+                                seed=episode_seed,
+                                object_body_ids=obj_bids,
+                                background_body_ids=pt_bg_bids,
+                                background_fraction=pt_bg_fraction,
+                                image_stride=pt_image_stride,
+                            )
+                        if len(cand_lc) > 0:
+                            cam_data["_candidates_lc"].append(cand_lc)
+                            cam_data["_candidates_bi"].append(cand_bi)
+                            if pt_use_kubric_sampling:
+                                cam_data["_candidates_geom_ids"].append(
+                                    np.array(
+                                        seg[
+                                            cand_query[:, 1].astype(int),
+                                            cand_query[:, 2].astype(int),
+                                            0,
+                                        ],
+                                        dtype=np.int32,
+                                        copy=True,
+                                    )
+                                )
+                                cam_data["_candidates_world"].append(cand_world)
+                                cam_data["_candidates_query_points"].append(cand_query)
+                                cam_data["_candidates_segment_ids"].append(
+                                    get_kubric_segment_ids(env.mj_model, cand_bi, obj_bids)
+                                )
                     continue
                 lc = cam_data.get("local_coords", pt_local_coords)
                 bi = cam_data.get("body_ids", pt_body_ids)
                 if lc is None or len(lc) == 0:
                     continue
                 coords_2d, vis, world_pts = track_points_for_frame(
-                    env.current_data, lc, bi, camera,
-                    cam_data["img_w"], cam_data["img_h"], depth,
+                    env.current_data,
+                    lc,
+                    bi,
+                    camera,
+                    cam_data["img_w"],
+                    cam_data["img_h"],
+                    depth,
                 )
                 cam_data["trajs_2d"].append(coords_2d)
                 cam_data["visibility"].append(vis)
@@ -1011,8 +1143,6 @@ class ParallelRolloutRunner:
                 datagen_profiler.end("task_step")
             # Point tracking per frame
             if do_point_tracking and len(pt_per_camera) > 0:
-                import numpy as np
-
                 env = task.env
                 # One observation is recorded for each action chunk. Keep point-track
                 # frames aligned with those observations rather than the number of
@@ -1035,22 +1165,77 @@ class ParallelRolloutRunner:
                             camera, cam_data["img_w"], cam_data["img_h"]
                         )
                         pt_stored_cam_matrices[cam_name].append((w2c.copy(), intr.copy()))
-                        if frame_idx % pt_query_interval == 0:
+                        seg = None
+                        if pt_use_kubric_sampling:
+                            # Visibility must be evaluated even on frames that
+                            # are not part of the Kubric query sampling grid.
                             seg = env.render_segmentation_frame(cam_name)
-                            cand_lc, cand_bi, _, _ = sample_from_image(
-                                env.mj_model, env.current_data,
-                                camera, cam_data["img_w"], cam_data["img_h"],
-                                depth, seg,
-                                max_points=total_budget,
-                                seed=episode_seed + frame_idx,
-                                object_body_ids=obj_bids,
-                                background_body_ids=pt_bg_bids,
-                                background_fraction=pt_bg_fraction,
-                                image_stride=pt_image_stride,
+                            pt_stored_geom_maps[cam_name].append(
+                                np.array(seg[:, :, 0], dtype=np.int32, copy=True)
                             )
+                            kubric_phase = cam_data["sampling_phase"]
+                            sample_query_frame = (
+                                frame_idx >= kubric_phase[0]
+                                and (frame_idx - kubric_phase[0]) % pt_kubric_stride == 0
+                            )
+                        else:
+                            sample_query_frame = frame_idx % pt_query_interval == 0
+                        if sample_query_frame:
+                            if seg is None:
+                                seg = env.render_segmentation_frame(cam_name)
+                            if pt_use_kubric_sampling:
+                                cand_lc, cand_bi, cand_world, cand_query = (
+                                    sample_kubric_candidates_from_image(
+                                        env.mj_model,
+                                        env.current_data,
+                                        camera,
+                                        cam_data["img_w"],
+                                        cam_data["img_h"],
+                                        depth,
+                                        seg,
+                                        frame_index=frame_idx,
+                                        sampling_stride=pt_kubric_stride,
+                                        spatial_phase=kubric_phase[1:],
+                                        object_body_ids=obj_bids,
+                                        include_background=pt_include_background,
+                                    )
+                                )
+                            else:
+                                cand_lc, cand_bi, _, _ = sample_from_image(
+                                    env.mj_model,
+                                    env.current_data,
+                                    camera,
+                                    cam_data["img_w"],
+                                    cam_data["img_h"],
+                                    depth,
+                                    seg,
+                                    max_points=total_budget,
+                                    seed=episode_seed + frame_idx,
+                                    object_body_ids=obj_bids,
+                                    background_body_ids=pt_bg_bids,
+                                    background_fraction=pt_bg_fraction,
+                                    image_stride=pt_image_stride,
+                                )
                             if len(cand_lc) > 0:
                                 cam_data["_candidates_lc"].append(cand_lc)
                                 cam_data["_candidates_bi"].append(cand_bi)
+                                if pt_use_kubric_sampling:
+                                    cam_data["_candidates_geom_ids"].append(
+                                        np.array(
+                                            seg[
+                                                cand_query[:, 1].astype(int),
+                                                cand_query[:, 2].astype(int),
+                                                0,
+                                            ],
+                                            dtype=np.int32,
+                                            copy=True,
+                                        )
+                                    )
+                                    cam_data["_candidates_world"].append(cand_world)
+                                    cam_data["_candidates_query_points"].append(cand_query)
+                                    cam_data["_candidates_segment_ids"].append(
+                                        get_kubric_segment_ids(env.mj_model, cand_bi, obj_bids)
+                                    )
                         continue
 
                     lc = cam_data.get("local_coords", pt_local_coords)
@@ -1058,8 +1243,13 @@ class ParallelRolloutRunner:
                     if lc is None or len(lc) == 0:
                         continue
                     coords_2d, vis, world_pts = track_points_for_frame(
-                        env.current_data, lc, bi, camera,
-                        cam_data["img_w"], cam_data["img_h"], depth,
+                        env.current_data,
+                        lc,
+                        bi,
+                        camera,
+                        cam_data["img_w"],
+                        cam_data["img_h"],
+                        depth,
                     )
                     cam_data["trajs_2d"].append(coords_2d)
                     cam_data["visibility"].append(vis)
@@ -1098,59 +1288,199 @@ class ParallelRolloutRunner:
 
         # Stash point tracking data on the task for the caller to retrieve
         if do_point_tracking and len(pt_per_camera) > 0:
-            import numpy as np
-
             # Preview mode Phase 2: sample from candidates and compute full tracks
             if pt_preview_mode:
                 n_frames = len(pt_stored_body_xpos)
-                rng = np.random.RandomState(episode_seed + 9999)
-                for cam_name, cam_data in pt_per_camera.items():
-                    cand_lc_list = cam_data.pop("_candidates_lc", [])
-                    cand_bi_list = cam_data.pop("_candidates_bi", [])
-                    if not cand_lc_list:
+
+                def replay_frame(camera_name, frame_index, local_coords, body_ids, geom_ids=None):
+                    """Project using the body, camera, and render buffers saved for this frame."""
+                    camera_data = pt_per_camera[camera_name]
+                    world_to_camera, intrinsics = pt_stored_cam_matrices[camera_name][frame_index]
+                    return track_points_for_frame(
+                        _BodyPoseSnapshot(
+                            pt_stored_body_xpos[frame_index],
+                            pt_stored_body_xmat[frame_index],
+                        ),
+                        local_coords,
+                        body_ids,
+                        camera=None,
+                        img_width=camera_data["img_w"],
+                        img_height=camera_data["img_h"],
+                        depth_frame=pt_stored_depths[camera_name][frame_index],
+                        precomputed_w2c=world_to_camera,
+                        precomputed_intrinsics=intrinsics,
+                        segmentation_frame=(
+                            pt_stored_geom_maps[camera_name][frame_index][:, :, None]
+                            if geom_ids is not None
+                            else None
+                        ),
+                        geom_ids=geom_ids,
+                        return_diagnostics=geom_ids is not None,
+                    )
+
+                def select_video_candidates(candidates, seed, camera_names):
+                    """Keep the segment budget while replacing tracks with uncertain visibility."""
+                    if not pt_exclude_raster_ambiguous:
+                        selected = select_kubric_candidate_indices(
+                            candidates["body_ids"],
+                            max_points=total_budget,
+                            seed=seed,
+                            max_sampled_fraction=pt_kubric_max_sampled_fraction,
+                            segment_ids=candidates["segment_ids"],
+                        )
+                        return selected, None
+
+                    def candidate_is_valid(indices):
+                        keep = np.ones(len(indices), dtype=bool)
+                        for camera_name in camera_names:
+                            for frame_index in range(n_frames):
+                                active = np.flatnonzero(keep)
+                                if not len(active):
+                                    return keep
+                                rows = indices[active]
+                                *_, diagnostics = replay_frame(
+                                    camera_name,
+                                    frame_index,
+                                    candidates["local_coords"][rows],
+                                    candidates["body_ids"][rows],
+                                    candidates["geom_ids"][rows],
+                                )
+                                keep[active] &= ~diagnostics["raster_ambiguous"]
+                        return keep
+
+                    return select_unambiguous_kubric_candidate_indices(
+                        candidates["body_ids"],
+                        max_points=total_budget,
+                        seed=seed,
+                        candidate_is_valid=candidate_is_valid,
+                        max_sampled_fraction=pt_kubric_max_sampled_fraction,
+                        segment_ids=candidates["segment_ids"],
+                        max_rejection_rounds=pt_max_rejection_rounds,
+                    )
+
+                # Aligned videos share one candidate pool and all-camera visibility checks.
+                # Independent videos each own their pool, seed, and visibility checks.
+                camera_groups = (
+                    [tuple(pt_per_camera)]
+                    if pt_align_across_cameras
+                    else [(name,) for name in pt_per_camera]
+                )
+                candidate_keys = {
+                    "local_coords": "_candidates_lc",
+                    "body_ids": "_candidates_bi",
+                }
+                if pt_use_kubric_sampling:
+                    candidate_keys.update(
+                        geom_ids="_candidates_geom_ids",
+                        initial_world="_candidates_world",
+                        query_points="_candidates_query_points",
+                        segment_ids="_candidates_segment_ids",
+                    )
+                # Keep the existing shared RNG for legacy per-camera sampling.
+                legacy_rng = np.random.RandomState(episode_seed + 9999)
+                for camera_names in camera_groups:
+                    pooled = {name: [] for name in candidate_keys}
+                    source_cameras = []
+                    for camera_name in camera_names:
+                        camera_data = pt_per_camera[camera_name]
+                        for name, key in candidate_keys.items():
+                            batches = camera_data.pop(key)
+                            pooled[name].extend(batches)
+                            if name == "local_coords":
+                                source_cameras.append(
+                                    np.full(sum(len(batch) for batch in batches), camera_name)
+                                )
+
+                        histories = [pt_stored_cam_matrices, pt_stored_depths]
+                        if pt_use_kubric_sampling:
+                            histories.append(pt_stored_geom_maps)
+                        if n_frames == 0 or any(
+                            len(history.get(camera_name, [])) != n_frames for history in histories
+                        ):
+                            raise RuntimeError(f"Incomplete point-track history for {camera_name}")
+
+                    if not pooled["local_coords"]:
                         continue
-                    all_lc = np.concatenate(cand_lc_list, axis=0)
-                    all_bi = np.concatenate(cand_bi_list, axis=0)
-
-                    n_sample = min(total_budget, len(all_lc))
-                    idx = rng.choice(len(all_lc), n_sample, replace=False)
-                    final_lc = all_lc[idx]
-                    final_bi = all_bi[idx]
-
-                    cam_data["local_coords"] = final_lc
-                    cam_data["body_ids"] = final_bi
-                    cam_data["initial_world"] = None
-                    cam_data["total_verts"] = None
-
-                    stored_mats = pt_stored_cam_matrices.get(cam_name, [])
-                    stored_deps = pt_stored_depths.get(cam_name, [])
-                    for t in range(n_frames):
-                        mock_data = _make_mock_data(
-                            pt_stored_body_xpos[t], pt_stored_body_xmat[t]
+                    candidates = {
+                        name: np.concatenate(batches, axis=0) for name, batches in pooled.items()
+                    }
+                    candidate_count = len(candidates["local_coords"])
+                    if pt_use_kubric_sampling:
+                        candidates["query_source_cameras"] = np.concatenate(source_cameras)
+                        seed = pt_per_camera[camera_names[0]]["_sampling_seed"]
+                        selected, filter_stats = select_video_candidates(
+                            candidates, seed, camera_names
                         )
-                        past_w2c, past_intr = stored_mats[t]
-                        c2d, vis, wpts = track_points_for_frame(
-                            mock_data, final_lc, final_bi, None,
-                            cam_data["img_w"], cam_data["img_h"],
-                            stored_deps[t],
-                            precomputed_w2c=past_w2c,
-                            precomputed_intrinsics=past_intr,
+                    else:
+                        selected = legacy_rng.choice(
+                            candidate_count, min(total_budget, candidate_count), replace=False
                         )
-                        cam_data["trajs_2d"].append(c2d)
-                        cam_data["visibility"].append(vis)
-                        cam_data["points_3d"].append(wpts)
+                        filter_stats = None
+                    selected_points = {
+                        name: values[selected] for name, values in candidates.items()
+                    }
+                    point_count = len(selected)
 
-                    # Set query_frames to first frame each point is visible
-                    vis_stack = np.stack(cam_data["visibility"], axis=0)  # (T, N)
-                    first_vis = np.argmax(vis_stack > 0.5, axis=0)  # first True per column
-                    never_vis = vis_stack.max(axis=0) <= 0.5
-                    first_vis[never_vis] = 0
-                    cam_data["query_frames"] = first_vis.tolist()
+                    for camera_name in camera_names:
+                        camera_data = pt_per_camera[camera_name]
+                        camera_data["local_coords"] = selected_points["local_coords"]
+                        camera_data["body_ids"] = selected_points["body_ids"]
+                        camera_data["initial_world"] = selected_points.get("initial_world")
+                        camera_data["total_verts"] = (
+                            candidate_count if pt_use_kubric_sampling else None
+                        )
+                        if pt_use_kubric_sampling:
+                            query_frames = selected_points["query_points"][:, 0].astype(np.int32)
+                            camera_data.update(
+                                geom_ids=selected_points["geom_ids"],
+                                segment_ids=selected_points["segment_ids"],
+                                query_frames=query_frames.tolist(),
+                                query_points=selected_points["query_points"],
+                                query_source_cameras=selected_points["query_source_cameras"],
+                                track_ids=np.arange(point_count, dtype=np.int32),
+                                aligned_across_cameras=pt_align_across_cameras,
+                                visibility_filter_stats=filter_stats,
+                            )
 
-                    print(
-                        f"Preview-sampled {n_sample} points from "
-                        f"{len(all_lc)} candidates across "
-                        f"{len(cand_lc_list)} frames for {cam_name}"
+                        for frame_index in range(n_frames):
+                            frame_tracks = replay_frame(
+                                camera_name,
+                                frame_index,
+                                selected_points["local_coords"],
+                                selected_points["body_ids"],
+                                selected_points.get("geom_ids"),
+                            )
+                            coords_2d, visibility, world_points = frame_tracks[:3]
+                            camera_data["trajs_2d"].append(coords_2d)
+                            camera_data["visibility"].append(visibility)
+                            camera_data["points_3d"].append(world_points)
+                            if pt_use_kubric_sampling:
+                                diagnostics = frame_tracks[3]
+                                camera_data["in_frame"].append(diagnostics["in_frame"])
+                                camera_data["raster_ambiguous"].append(
+                                    diagnostics["raster_ambiguous"]
+                                )
+
+                        if pt_align_across_cameras:
+                            # Query time is shared; query coordinates belong to each camera.
+                            # A query only needs to be visible in its source camera.
+                            trajectories = np.stack(camera_data["trajs_2d"], axis=0)
+                            query_xy = trajectories[query_frames, np.arange(point_count)]
+                            camera_data["query_points"] = np.column_stack(
+                                (query_frames, query_xy[:, 1], query_xy[:, 0])
+                            ).astype(np.float32)
+                        elif not pt_use_kubric_sampling:
+                            # Preserve the legacy query time: the first visible frame.
+                            visible = np.stack(camera_data["visibility"], axis=0) > 0.5
+                            camera_data["query_frames"] = np.argmax(visible, axis=0).tolist()
+
+                    log.info(
+                        "%s sampling selected %d tracks from %d candidates for %s; visibility filter: %s",
+                        "Kubric" if pt_use_kubric_sampling else "Legacy image",
+                        point_count,
+                        candidate_count,
+                        camera_names,
+                        filter_stats,
                     )
 
             point_track_data = {}
@@ -1173,11 +1503,44 @@ class ParallelRolloutRunner:
                     "intrinsics": cam_data["intrinsics"],
                     "total_mesh_verts": cam_tverts,
                     "query_frames": np.array(qf, dtype=np.int32),
+                    "query_points": cam_data.get("query_points"),
+                    "sampling_method": cam_data["sampling_method"],
+                    "sampling_stride": cam_data["sampling_stride"],
+                    "sampling_phase": cam_data["sampling_phase"],
+                    "max_sampled_fraction": cam_data["max_sampled_fraction"],
+                    "segment_ids": cam_data.get("segment_ids"),
+                    "track_ids": cam_data.get("track_ids"),
+                    "aligned_across_cameras": cam_data.get("aligned_across_cameras"),
+                    "query_source_cameras": cam_data.get("query_source_cameras"),
                 }
+                if pt_use_kubric_sampling:
+                    point_track_data[cam_name].update(
+                        geom_ids=cam_data["geom_ids"],
+                        visibility_method=cam_data["visibility_method"],
+                        in_frame=np.stack(cam_data["in_frame"], axis=0),
+                        raster_ambiguous=np.stack(cam_data["raster_ambiguous"], axis=0),
+                        exclude_raster_ambiguous=pt_exclude_raster_ambiguous,
+                        visibility_filter_stats=cam_data.get("visibility_filter_stats"),
+                        visibility_check_cameras=np.asarray(
+                            tuple(pt_per_camera) if pt_align_across_cameras else (cam_name,),
+                            dtype=str,
+                        ),
+                    )
+            if pt_exclude_raster_ambiguous:
+                if total_budget <= 0 or set(point_track_data) != set(pt_per_camera):
+                    raise RuntimeError(
+                        "Clean Kubric sampling did not produce tracks for every camera"
+                    )
+                for name, values in point_track_data.items():
+                    if values["trajs_2d"].shape[1] != total_budget or np.any(
+                        values["raster_ambiguous"]
+                    ):
+                        raise RuntimeError(f"Clean Kubric track invariant failed for camera {name}")
             task._point_track_data = point_track_data
             pt_stored_body_xpos.clear()
             pt_stored_body_xmat.clear()
             pt_stored_depths.clear()
+            pt_stored_geom_maps.clear()
             pt_stored_cam_matrices.clear()
         else:
             task._point_track_data = None

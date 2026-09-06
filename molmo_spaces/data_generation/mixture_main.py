@@ -31,6 +31,15 @@ Usage::
         --include-background RUMPickPointTrack=1 \\
         --bg-fraction RUMPickPointTrack=0.3
 
+    # Toggle Kubric's space-time/per-segment point sampler for an A/B run.
+    python -m molmo_spaces.data_generation.mixture_main RUMPickPointTrackOnly \\
+        --kubric-sampling RUMPickPointTrack=true
+
+    # Select one shared Kubric point set and project it into every camera.
+    python -m molmo_spaces.data_generation.mixture_main RUMPickPointTrackOnly \\
+        --kubric-sampling RUMPickPointTrack=true \\
+        --align-across-cameras RUMPickPointTrack=true
+
     # List available mixtures.
     python -m molmo_spaces.data_generation.mixture_main --list
 """
@@ -64,24 +73,18 @@ MIXTURES_OUTPUT_ROOT = ASSETS_DIR / "experiment_output" / "datagen" / "mixtures"
 
 def _parse_kv_int(arg: str) -> tuple[str, int]:
     if "=" not in arg:
-        raise argparse.ArgumentTypeError(
-            f"Expected format NAME=INT, got {arg!r}"
-        )
+        raise argparse.ArgumentTypeError(f"Expected format NAME=INT, got {arg!r}")
     name, value = arg.split("=", 1)
     name = name.strip()
     try:
         return name, int(value)
     except ValueError as e:
-        raise argparse.ArgumentTypeError(
-            f"Invalid integer in override {arg!r}: {e}"
-        ) from e
+        raise argparse.ArgumentTypeError(f"Invalid integer in override {arg!r}: {e}") from e
 
 
 def _parse_kv_bool(arg: str) -> tuple[str, bool]:
     if "=" not in arg:
-        raise argparse.ArgumentTypeError(
-            f"Expected format NAME=BOOL, got {arg!r}"
-        )
+        raise argparse.ArgumentTypeError(f"Expected format NAME=BOOL, got {arg!r}")
     name, value = arg.split("=", 1)
     name = name.strip()
     v = value.strip().lower()
@@ -89,24 +92,18 @@ def _parse_kv_bool(arg: str) -> tuple[str, bool]:
         return name, True
     if v in ("0", "false", "no", "off", "n", "f"):
         return name, False
-    raise argparse.ArgumentTypeError(
-        f"Invalid bool in override {arg!r}: expected 0/1/true/false"
-    )
+    raise argparse.ArgumentTypeError(f"Invalid bool in override {arg!r}: expected 0/1/true/false")
 
 
 def _parse_kv_float(arg: str) -> tuple[str, float]:
     if "=" not in arg:
-        raise argparse.ArgumentTypeError(
-            f"Expected format NAME=FLOAT, got {arg!r}"
-        )
+        raise argparse.ArgumentTypeError(f"Expected format NAME=FLOAT, got {arg!r}")
     name, value = arg.split("=", 1)
     name = name.strip()
     try:
         return name, float(value)
     except ValueError as e:
-        raise argparse.ArgumentTypeError(
-            f"Invalid float in override {arg!r}: {e}"
-        ) from e
+        raise argparse.ArgumentTypeError(f"Invalid float in override {arg!r}: {e}") from e
 
 
 def get_args() -> argparse.Namespace:
@@ -119,6 +116,12 @@ def get_args() -> argparse.Namespace:
         nargs="?",
         type=str,
         help="Name of the registered mixture to run (see --list).",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Seed house selection and component task sampling for reproducible runs.",
     )
     parser.add_argument(
         "--override",
@@ -165,6 +168,24 @@ def get_args() -> argparse.Namespace:
         "(repeatable). Float in [0, 1].",
     )
     parser.add_argument(
+        "--kubric-sampling",
+        action="append",
+        default=[],
+        type=_parse_kv_bool,
+        metavar="CONFIG=BOOL",
+        help="Toggle Kubric space-time/per-segment point sampling for a "
+        "component (repeatable). Accepts 0/1/true/false.",
+    )
+    parser.add_argument(
+        "--align-across-cameras",
+        action="append",
+        default=[],
+        type=_parse_kv_bool,
+        metavar="CONFIG=BOOL",
+        help="Toggle shared-identity multiview Kubric sampling for a component "
+        "(repeatable). Requires Kubric sampling.",
+    )
+    parser.add_argument(
         "--list",
         action="store_true",
         help="List registered mixtures and exit.",
@@ -179,6 +200,8 @@ def apply_overrides(
     points_overrides: list[tuple[str, int]] | None = None,
     bg_flag_overrides: list[tuple[str, bool]] | None = None,
     bg_fraction_overrides: list[tuple[str, float]] | None = None,
+    kubric_sampling_overrides: list[tuple[str, bool]] | None = None,
+    align_across_cameras_overrides: list[tuple[str, bool]] | None = None,
 ) -> MixtureSpec:
     """Return a new MixtureSpec with the requested per-component overrides."""
     house_map = dict(house_overrides)
@@ -186,6 +209,8 @@ def apply_overrides(
     points_map = dict(points_overrides or [])
     bg_flag_map = dict(bg_flag_overrides or [])
     bg_fraction_map = dict(bg_fraction_overrides or [])
+    kubric_sampling_map = dict(kubric_sampling_overrides or [])
+    align_across_cameras_map = dict(align_across_cameras_overrides or [])
     known_names = {c.config_name for c in spec.components}
     for name in (
         *house_map,
@@ -193,6 +218,8 @@ def apply_overrides(
         *points_map,
         *bg_flag_map,
         *bg_fraction_map,
+        *kubric_sampling_map,
+        *align_across_cameras_map,
     ):
         if name not in known_names:
             raise ValueError(
@@ -205,14 +232,18 @@ def apply_overrides(
             config_name=c.config_name,
             num_houses=house_map.get(c.config_name, c.num_houses),
             samples_per_house=samples_map.get(c.config_name, c.samples_per_house),
-            point_track_num_points=points_map.get(
-                c.config_name, c.point_track_num_points
-            ),
+            point_track_num_points=points_map.get(c.config_name, c.point_track_num_points),
             point_track_include_background=bg_flag_map.get(
                 c.config_name, c.point_track_include_background
             ),
             point_track_background_fraction=bg_fraction_map.get(
                 c.config_name, c.point_track_background_fraction
+            ),
+            point_track_use_kubric_sampling=kubric_sampling_map.get(
+                c.config_name, c.point_track_use_kubric_sampling
+            ),
+            point_track_align_across_cameras=align_across_cameras_map.get(
+                c.config_name, c.point_track_align_across_cameras
             ),
             scene_dataset=c.scene_dataset,
             data_split=c.data_split,
@@ -226,10 +257,13 @@ def _instantiate_component(
     component: MixtureComponent,
     max_house_index: int,
     component_output_dir: Path,
+    run_seed: int | None = None,
 ):
     """Build the sub-config instance for one component, applying overrides."""
     cfg_cls = get_config_class(component.config_name)
     exp_config = cfg_cls()
+    if run_seed is not None:
+        exp_config.seed = run_seed
 
     if component.scene_dataset is not None:
         if not hasattr(exp_config, "scene_dataset"):
@@ -280,9 +314,7 @@ def _instantiate_component(
                 f"Component {component.config_name!r} sub-config does not "
                 f"expose `point_track_include_background`."
             )
-        exp_config.point_track_include_background = (
-            component.point_track_include_background
-        )
+        exp_config.point_track_include_background = component.point_track_include_background
 
     if component.point_track_background_fraction is not None:
         frac = component.point_track_background_fraction
@@ -298,6 +330,35 @@ def _instantiate_component(
             )
         exp_config.point_track_background_fraction = frac
 
+    if component.point_track_use_kubric_sampling is not None:
+        if not hasattr(exp_config, "point_track_use_kubric_sampling"):
+            raise ValueError(
+                f"Component {component.config_name!r} sub-config does not "
+                f"expose `point_track_use_kubric_sampling`."
+            )
+        if component.point_track_use_kubric_sampling and exp_config.point_track_sampling != "image":
+            raise ValueError(
+                f"Component {component.config_name!r}: Kubric sampling "
+                "requires point_track_sampling='image'."
+            )
+        exp_config.point_track_use_kubric_sampling = component.point_track_use_kubric_sampling
+
+    if component.point_track_align_across_cameras is not None:
+        if not hasattr(exp_config, "point_track_align_across_cameras"):
+            raise ValueError(
+                f"Component {component.config_name!r} sub-config does not "
+                f"expose `point_track_align_across_cameras`."
+            )
+        if (
+            component.point_track_align_across_cameras
+            and not exp_config.point_track_use_kubric_sampling
+        ):
+            raise ValueError(
+                f"Component {component.config_name!r}: aligned multiview "
+                "sampling requires point_track_use_kubric_sampling=True."
+            )
+        exp_config.point_track_align_across_cameras = component.point_track_align_across_cameras
+
     exp_config.output_dir = component_output_dir
     return exp_config
 
@@ -305,6 +366,8 @@ def _instantiate_component(
 def main() -> int:
     print("[BOOT] entering mixture_main()", flush=True)
     args = get_args()
+    if args.seed is not None:
+        random.seed(args.seed)
 
     print("[BOOT] auto-importing configs...", flush=True)
     auto_import_configs()
@@ -317,9 +380,7 @@ def main() -> int:
         else:
             for name in names:
                 spec = get_mixture(name)
-                comps = ", ".join(
-                    f"{c.config_name}={c.num_houses}" for c in spec.components
-                )
+                comps = ", ".join(f"{c.config_name}={c.num_houses}" for c in spec.components)
                 print(f"{name}: {comps}")
         return 0
 
@@ -335,6 +396,8 @@ def main() -> int:
         args.points_override,
         args.include_background,
         args.bg_fraction,
+        args.kubric_sampling,
+        args.align_across_cameras,
     )
 
     # Self-heal any partially-extracted resource cache entries before workers
@@ -352,6 +415,7 @@ def main() -> int:
         json.dumps(
             {
                 "mixture_name": args.mixture_name,
+                "seed": args.seed,
                 "max_house_index": spec.max_house_index,
                 "components": [asdict(c) for c in spec.components],
             },
@@ -373,7 +437,7 @@ def main() -> int:
 
         try:
             exp_config = _instantiate_component(
-                component, spec.max_house_index, component_dir
+                component, spec.max_house_index, component_dir, args.seed
             )
             exp_config.save_config()
             runner = ParallelRolloutRunner(exp_config)

@@ -103,18 +103,28 @@ class MlSpacesExpConfig(Config, ABC):
     generate_point_tracks: bool = False
     point_track_num_points: int = 5000
     point_track_sampling: str = "vertex"  # "vertex" or "image"
-    point_track_query_interval: int = 0  # 0 = all points from frame 0; N>0 = preview mode
-    point_tracks_only: bool = False  # skip HDF5/depth/robot-state sensors, keep only RGB + point tracks
-    # When True (and point_track_sampling=="image"), reserve a fraction of the
-    # point budget for static scene geometry (walls, floor, furniture) in
-    # addition to the usual trackable bodies (free-joint objects + robot).
-    # Background points are still tracked rigidly, but since their bodies are
-    # static the trajectories collapse to camera-motion-only signal.
+    # Legacy image sampling: 0 samples at frame 0; N > 0 samples every N recorded frames.
+    point_track_query_interval: int = 0
+    # Save RGB and point tracks without the normal HDF5 observation bundle.
+    point_tracks_only: bool = False
+    # Image sampling can also track static scene geometry (walls, floor, furniture).
+    # Legacy sampling reserves the fraction below; Kubric uses one background segment.
     point_track_include_background: bool = False
     point_track_background_fraction: float = 0.25
-    # Image sampling only: subsample candidate pixels on a square stride grid
-    # with random phase (Kubric-style). 1 = dense (legacy) sampling.
+    # Legacy image sampler's spatial stride. 1 samples from all eligible pixels.
     point_track_image_stride: int = 1
+    # Image sampling only: use a random-phase space-time grid and balance by segment.
+    point_track_use_kubric_sampling: bool = False
+    point_track_kubric_sampling_stride: int = 4
+    point_track_kubric_max_sampled_fraction: float = 0.1
+    # Kubric only: share one ordered physical point set across cameras.
+    # False gives each camera its own candidate pool, grid phase, seed, and track IDs.
+    point_track_align_across_cameras: bool = False
+    # Replace tracks with ambiguous geometry/depth support in any recorded frame.
+    # Check the owning camera for independent tracks, or all cameras for shared tracks.
+    # False keeps uncertain observations with visibility_valid=False in the NPZ.
+    point_track_exclude_raster_ambiguous: bool = True
+    point_track_visibility_max_rejection_rounds: int = 32
 
     def model_post_init(self, _context) -> None:
         """This serves as the __init__() called after internal validation of config parameters"""

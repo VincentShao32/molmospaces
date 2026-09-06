@@ -309,22 +309,27 @@ episode per house, and 5,000 points for every generated camera video:
 ```bash
 python -m molmo_spaces.data_generation.mixture_main \
     FrankaPickPointTrackOnly \
+    --seed 123 \
     --override FrankaPickPointTrackDebug=10 \
     --samples-override FrankaPickPointTrackDebug=1 \
     --points-override FrankaPickPointTrackDebug=5000 \
     --include-background FrankaPickPointTrackDebug=true \
-    --bg-fraction FrankaPickPointTrackDebug=0.2
+    --kubric-sampling FrankaPickPointTrackDebug=true \
+    --align-across-cameras FrankaPickPointTrackDebug=true
 ```
 
 Available scale and sampling overrides are:
 
 | Flag | Meaning |
 |---|---|
+| `--seed N` | Reproduce house selection and task/sampler randomization across A/B runs |
 | `--override CONFIG=N` | Sample `N` unique house indices for that component |
 | `--samples-override CONFIG=N` | Request `N` episodes per sampled house |
 | `--points-override CONFIG=N` | Track `N` points in each camera video |
-| `--include-background CONFIG=BOOL` | Reserve some tracks for static scene geometry |
-| `--bg-fraction CONFIG=F` | Set the background fraction to `F` in `[0, 1]` |
+| `--include-background CONFIG=BOOL` | Include static scene geometry in the candidate pool |
+| `--bg-fraction CONFIG=F` | Legacy image sampling only: set the background fraction to `F` in `[0, 1]` |
+| `--kubric-sampling CONFIG=BOOL` | Toggle Kubric space-time/per-segment sampling |
+| `--align-across-cameras CONFIG=BOOL` | Pool Kubric candidates across cameras and project one shared point set into every view |
 
 Flags are repeatable for multi-component mixtures. Each invocation samples its
 houses independently and creates a new timestamped output directory.
@@ -342,17 +347,48 @@ point_track_query_interval: int = 20
 point_tracks_only: bool = True
 point_track_include_background: bool = True
 point_track_background_fraction: float = 0.2
+point_track_use_kubric_sampling: bool = False
+point_track_kubric_sampling_stride: int = 4
+point_track_kubric_max_sampled_fraction: float = 0.1
+point_track_align_across_cameras: bool = False
+point_track_exclude_raster_ambiguous: bool = True
+point_track_visibility_max_rejection_rounds: int = 32
 ```
 
 | Field | Description |
 |---|---|
 | `generate_point_tracks` | Enable point track generation |
 | `point_track_num_points` | Number of points to track per camera video |
-| `point_track_sampling` | `"vertex"` samples actual mesh vertices with equal per-body allocation. `"image"` (recommended) picks visible pixels from the rendered image and unprojects to 3D, Kubric/TAP-Vid style — guarantees initial visibility. |
-| `point_track_query_interval` | `0` (default) samples all points at frame 0. When set to `N > 0` (requires `"image"` mode), 1/4 of points are sampled at frame 0 and new batches are sampled every N steps from newly visible regions. Every point is tracked across all frames; points sampled later have `visibility=0` for earlier frames. |
+| `point_track_sampling` | `"vertex"` samples mesh vertices with equal per-body allocation. `"image"` samples rendered pixels and unprojects them to body-local 3D coordinates; each query originates in a visible source view. |
+| `point_track_query_interval` | Legacy image sampler only: `0` samples at frame 0; `N > 0` collects candidate batches every `N` recorded frames. Kubric sampling uses its own shared temporal stride instead. |
 | `point_tracks_only` | Save RGB videos and point tracks without producing the normal HDF5 observation bundle |
 | `point_track_include_background` | Include points on static scene geometry as well as task/robot bodies |
-| `point_track_background_fraction` | Fraction of the point budget reserved for background geometry |
+| `point_track_background_fraction` | Legacy image sampler only: fraction of the point budget reserved for background geometry |
+| `point_track_use_kubric_sampling` | When true, use a random-phase `(t, y, x)` grid, balance the final budget across logical object segments (with one collapsed static background segment), and retain the true query frame/pixel. False preserves legacy generation. |
+| `point_track_kubric_sampling_stride` | Stride in recorded video frames and pixels; default `4`. |
+| `point_track_kubric_max_sampled_fraction` | Per-segment allocation cap as a fraction of its grid candidate count; default `0.1`. Short samples are padded with repeated points. |
+| `point_track_align_across_cameras` | Kubric image sampling only. Pool candidates from every camera, select one segment-balanced body-local 3D point set, and project the same ordered points into every camera. Each camera retains its own 2D coordinates and visibility. |
+| `point_track_exclude_raster_ambiguous` | Kubric only; default `True`. Replace tracks with ambiguous visibility in any recorded frame, within the same logical segment. Independent tracks check their owning camera; aligned tracks check every output camera. |
+| `point_track_visibility_max_rejection_rounds` | Maximum rounds of replacement draws; default `32`. If reliable tracks cannot fill the segment allocation, the rollout fails rather than exporting ambiguous labels. |
+
+For a controlled comparison, run the same mixture with the same `--seed` twice,
+once with `--kubric-sampling CONFIG=false` and once with it set to `true`.
+Using one worker gives the strongest episode-for-episode reproducibility.
+Kubric mode uses per-segment balancing rather than
+`point_track_background_fraction`.
+
+Kubric selection samples with replacement and pads short allocations, so the
+requested track count can include repeated physical points. Tracks are projected
+through every recorded frame, including frames before their query time; visibility
+is evaluated from geometry rather than forced to zero before the query.
+
+Kubric visibility checks the four pixels surrounding each projection. A visible
+point needs matching geometry and depth within `max(1 mm, 1% of point depth)`.
+If the neighboring rendered surfaces are definitively closer, the point is
+occluded; otherwise unsupported in-frame projections are marked ambiguous.
+Setting `point_track_exclude_raster_ambiguous=False` retains those observations
+with `visibility_valid=False`; exclude them from supervision and scoring.
+Legacy image and vertex modes retain their existing depth test.
 
 #### Output layout and format
 
@@ -386,13 +422,37 @@ with np.load("episode_00000000_exo_camera_1_point_tracks.npz") as data:
 | Key | Shape | Description |
 |---|---|---|
 | `trajs_2d` | `(T, N, 2)` | 2D pixel coordinates per frame |
-| `visibility` | `(T, N)` | `1.0` = visible, `0.0` = occluded or out of frame |
+| `visibility` | `(T, N)` | `1.0` = visible. `0.0` also includes ambiguity when ambiguity exclusion is disabled; use `visibility_valid` for Kubric tracks. |
 | `points_3d` | `(T, N, 3)` | 3D world positions per frame |
 | `body_ids` | `(N,)` | MuJoCo body ID each point belongs to |
+| `segment_ids` | `(N,)` | Kubric-mode logical allocation segment; static scene bodies share segment `0` |
 | `intrinsics` | `(3, 3)` | Camera intrinsic matrix |
-| `query_frames` | `(N,)` | Frame at which each point was introduced |
-| `points_3d_initial` | `(N, 3)` | Optional initial 3D positions |
-| `num_sampled_from` | scalar | Optional mesh-vertex population size |
+| `query_frames` | `(N,)` | Kubric source query frame; legacy modes retain their original query-frame convention |
+| `query_points` | `(N, 3)` | Per-camera Kubric queries in `[t, y, x]`. Source-camera candidates use half-integer pixel centers; aligned projections into other cameras are continuous. |
+| `points_3d_initial` | `(N, 3)` | Kubric world positions at each point's source query frame; initial positions for other modes, when available |
+| `num_sampled_from` | scalar | Source population size: mesh vertices in vertex mode or space-time grid candidates in Kubric mode |
+| `sampling_method` | scalar string | `vertex`, `image`, or `kubric` |
+| `sampling_stride` | scalar | Spatial stride, or the shared space-time stride in Kubric mode |
+| `sampling_phase` | `(3,)` | Kubric-mode source-candidate grid phase in `[t, y, x]` order |
+| `max_sampled_fraction` | scalar | Kubric per-segment candidate cap, when applicable |
+| `track_ids` | `(N,)` | Kubric track IDs. Shared across cameras only when `aligned_across_cameras=True`; otherwise IDs are camera-local. |
+| `aligned_across_cameras` | scalar bool | True when the camera files share one ordered physical point set. |
+| `query_source_cameras` | `(N,)` strings | Camera that contributed each selected visible query candidate. The point may be invisible in another camera at that query frame. |
+| `geom_ids` | `(N,)` | Exact MuJoCo geometry identity used by Kubric visibility checks |
+| `in_frame` | `(T, N)` bool | Projection lies inside the image and in front of the camera |
+| `raster_ambiguous` | `(T, N)` bool | Neither visible surface support nor definite depth occlusion was established |
+| `visibility_valid` | `(T, N)` bool | False for ambiguous observations; always true when ambiguity exclusion is enabled |
+| `visibility_reason_codes` | `(T, N)` uint8 | Index into `visibility_reason_names`: visible, out of frame, depth-confirmed occlusion, or raster ambiguity |
+| `visibility_check_cameras` | `(C,)` strings | Cameras used to filter each track; owning camera only for independent tracks |
+
+Kubric NPZs also record the visibility method, depth tolerances,
+`exclude_raster_ambiguous`, and `visibility_filter_*` replacement statistics.
+
+With aligned multiview generation, corresponding episode camera files have
+identical `track_ids`, `body_ids`, `segment_ids`, `query_frames`, and
+`points_3d`. Their `trajs_2d`, `query_points`, and `visibility` are
+camera-specific. A candidate only needs to be visible in its source camera;
+use the per-camera visibility mask when constructing multiview training pairs.
 
 For a quick integrity check, verify that the point count is correct, arrays are
 finite, and visible coordinates lie inside the video frame:
@@ -416,7 +476,9 @@ with np.load("episode_00000000_exo_camera_1_point_tracks.npz") as data:
 #### Scaling and resource use
 
 Point-track generation renders every configured camera and retains per-frame
-track data until the episode is saved. Memory use therefore grows with the
+track data until the episode is saved. Kubric sampling also retains candidates,
+body/camera poses, depth, and one geometry-ID raster per frame for later replay.
+Whole-track visibility filtering may require several replay passes. Memory use grows with the
 number of worker processes, cameras, frames, and points. Begin with a small
 house count, monitor host memory as well as GPU utilization, and scale
 gradually. If a run exhausts host memory, reduce the config's `num_workers` or
@@ -506,7 +568,6 @@ Robot base conventions: +x=forward, +y=left, +z=up
 Robot parallel-jaw gripper conventions: +z=forward, fingers open along the y axis
 
 <img src="docs/images/robot_axis_conventions.png" width="480px">
-
 
 
 ## License
