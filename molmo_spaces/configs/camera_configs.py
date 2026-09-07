@@ -130,6 +130,9 @@ class RandomizedExocentricCameraConfig(CameraConfig):
     visibility_constraints: dict[str, float] | None = None
     max_placement_attempts: int = 100  # Max attempts to satisfy visibility constraints
     allow_relaxed_constraints: bool = False  # Use best attempt if constraints not met
+    min_geometry_clearance: float = 0.0  # Minimum camera-origin clearance from scene geometry
+    near_geometry_distance: float | None = None  # Depth threshold for near-view rejection
+    max_near_geometry_fraction: float = 1.0  # Maximum image fraction below the threshold
 
 
 class EvalRobotMountedCameraConfig(RobotMountedCameraConfig):
@@ -384,7 +387,7 @@ class FrankaRandomizedD405D455CameraSystem(CameraSystemConfig):
             pos_noise_range=(-0.015, 0.015),  # ±1.5cm position noise
             orientation_noise_degrees=8.0,  # ±8° rotation noise
         ),
-        # Two randomized exocentric cameras positioned around workspace center
+        # Three randomized exocentric cameras positioned around workspace center
         RandomizedExocentricCameraConfig(
             name="exo_camera_1",
             distance_range=(0.2, 0.8),
@@ -600,7 +603,7 @@ class FrankaWristOnlyCameraSystem(CameraSystemConfig):
 
 
 class FrankaRandomizedDroidCameraSystem(CameraSystemConfig):
-    """Camera system for Franka DROID system with wrist cam (ZED mini) and 2 randomized exo cams (ZED 2/ZED 2i).
+    """Franka DROID camera system with one wrist and three randomized exocameras.
 
     Uses workspace center from task sampler for dynamic placement. The task sampler
     should implement get_workspace_center() and resolve_visibility_object() to provide
@@ -615,7 +618,7 @@ class FrankaRandomizedDroidCameraSystem(CameraSystemConfig):
             mjcf_name="gripper/wrist_camera",
             robot_namespace="robot_0/",
             fov=52.0,
-            fov_noise_degrees=(-4.0, 4.0),
+            fov_noise_degrees=None,
             pos_noise_range=((-0.015, -0.005, -0.01), (0.015, 0.005, 0.01)),
             orientation_noise_degrees=(8.0, 4.0, 4.0),
         ),
@@ -625,41 +628,52 @@ class FrankaRandomizedDroidCameraSystem(CameraSystemConfig):
             distance_range=(0.2, 0.8),
             height_range=(0.05, 0.6),
             azimuth_range=(0, 2 * np.pi),
-            fov_range=(64, 72),
+            fov=52.0,
+            fov_range=None,
             lookat_noise_range=(-0.1, 0.1),
             visibility_constraints={
                 "__task_objects__": 0.0001,  # Resolved by task sampler
                 "__gripper__": 0.0001,  # Resolved by task sampler
             },
             allow_relaxed_constraints=False,
+            min_geometry_clearance=0.10,
+            near_geometry_distance=0.35,
+            max_near_geometry_fraction=0.10,
         ),
         RandomizedExocentricCameraConfig(
             name="exo_camera_2",
             distance_range=(0.2, 0.8),
             height_range=(0.05, 0.6),
             azimuth_range=(0, 2 * np.pi),
-            fov_range=(64, 72),
+            fov=52.0,
+            fov_range=None,
             lookat_noise_range=(-0.1, 0.1),
             visibility_constraints={
                 "__task_objects__": 0.0001,  # Resolved by task sampler
                 "__gripper__": 0.0001,  # Resolved by task sampler
             },
             allow_relaxed_constraints=False,
+            min_geometry_clearance=0.10,
+            near_geometry_distance=0.35,
+            max_near_geometry_fraction=0.10,
         ),
         RandomizedExocentricCameraConfig(
             name="exo_camera_3",
-            distance_range=(0.2, 0.5),
+            distance_range=(0.2, 0.8),
             height_range=(0.1, 0.6),
             azimuth_range=(0, 2 * np.pi),
-            fov_range=(137, 140),  # GoPro vertical FOV
-            is_warped=False,  # NOTE: baked in warping not yet implemented
+            fov=52.0,
+            fov_range=None,
             lookat_noise_range=(-0.1, 0.1),
             visibility_constraints={
                 "__task_objects__": 0.0001,  # Resolved by task sampler
                 "__gripper__": 0.0001,  # Resolved by task sampler
             },
-            max_placement_attempts=20,
+            max_placement_attempts=100,
             allow_relaxed_constraints=False,
+            min_geometry_clearance=0.10,
+            near_geometry_distance=0.35,
+            max_near_geometry_fraction=0.10,
         ),
     ]
 

@@ -487,6 +487,64 @@ scratch/data filesystem even when the repository and Python environment live
 elsewhere.
 
 
+### Multiview Pointing Snapshots
+
+Phase snapshots save synchronized still images for multiview pointing (MVP).
+Enable them in an experiment config:
+
+```python
+generate_phase_snapshots: bool = True
+phase_snapshots_only: bool = True
+phase_snapshot_generate_points: bool = True
+phase_snapshot_num_points: int = 1000
+phase_snapshot_point_sampling_mode: str = "failure_targeted"  # or "kubric"
+```
+
+The planner policy must expose `get_all_phases()` and a `policy_phase` sensor.
+By default, one image set is sampled uniformly from each of `pregrasp`, `grasp`,
+`gripper-close`, `lift`, `preplace`, `place`, `release`, `retreat`, and `go_home`.
+`release` means `gripper-open` after `place`. Episodes missing a required phase
+are rejected. Set `phase_snapshot_required_phases` for other policies, and
+`phase_snapshot_samples_per_phase` to retain more than one set per phase.
+
+Snapshot-only mode releases consumed camera frames and skips videos/HDF5; it
+cannot be combined with temporal point tracks. With `phase_snapshots_only=False`,
+snapshots accompany the usual trajectory outputs. Point generation runs only
+when a frame enters a phase's sampling reservoir, including later replacements.
+
+Both point samplers pool candidates from all configured cameras and select one
+shared physical point set. Candidates with ambiguous raster visibility in any
+view are excluded; depth-confirmed occlusions and out-of-frame projections remain
+valid examples. If no candidates survive, sampling fails. Points may repeat to
+fill the requested count when the eligible pool is small.
+
+`kubric` balances candidates by logical object. `failure_targeted` reserves quotas
+in this order: occluder edges (20%), cross-view occlusion (15%), object edges (20%),
+small/thin supports (20%), and baseline (25%). Baseline fills unavailable targeted
+quotas. Source points must be at least 2 pixels inside their logical segment;
+cross-view scoring uses at most 15,000 shortlisted candidates. Depth weighting
+downweights distant targeted candidates with a 0.10 weight floor at a 1 m
+reference depth. Config fields under `phase_snapshot_point_failure_*` control
+these settings. For equal gripper/pickup budgets, set
+`phase_snapshot_point_target_scope="gripper_and_pickup"` and
+`phase_snapshot_point_include_background=False`.
+
+Each house gets a `phase_snapshots_batch_<i>_of_<n>.json` manifest. Follow its
+relative paths to `episode_<index>_batch_<i>_of_<n>/metadata.json` and per-phase
+`sample_<index>/` directories containing camera PNGs and optional `points.npz`.
+The NPZ preserves point order across every camera: `track_ids`, body/geometry and
+segment IDs, local/world coordinates, query source camera, sampling diagnostics,
+and surface normals. Normals face the query camera and are saved in world,
+body-local, and query-camera frames. Per-camera keys such as
+`<camera>_points_2d`, `<camera>_visibility_reason`, and `<camera>_intrinsics` describe
+projections in pixel coordinates. This is raw generator output; MVP evaluation
+and training schemas require explicit conversion.
+
+The randomized DROID camera preset uses one wrist camera and three exocameras,
+all with 52-degree vertical FOV. Exocamera placement applies a 0.10 m sparse
+ray-based clearance check and rejects views with over 10% of pixels nearer than
+0.35 m. Other camera presets retain their own settings.
+
 ## Teleop Input
 
 To control a robot via phone-based teleoperation, do the following (only iPhones supported).

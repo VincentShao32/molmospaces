@@ -523,6 +523,62 @@ class CameraManager:
         """Initialize the camera manager with an empty registry."""
         self.registry: CameraRegistry = CameraRegistry()
 
+    @staticmethod
+    def camera_geometry_clearance(env, position: np.ndarray) -> float:
+        """Estimate surface clearance with 26 axial and diagonal rays.
+
+        This is a sparse proximity check, not an exact nearest-surface distance:
+        small geometry between the rays may be missed.
+        """
+
+        geomid = np.zeros(1, dtype=np.int32)
+        position = np.asarray(position, dtype=np.float64)
+        nearest_distance = np.inf
+        for x in (-1.0, 0.0, 1.0):
+            for y in (-1.0, 0.0, 1.0):
+                for z in (-1.0, 0.0, 1.0):
+                    direction = np.array([x, y, z], dtype=np.float64)
+                    norm = np.linalg.norm(direction)
+                    if norm == 0:
+                        continue
+                    direction /= norm
+                    distance = mj.mj_ray(
+                        env.current_model,
+                        env.current_data,
+                        position,
+                        direction,
+                        None,
+                        1,
+                        -1,
+                        geomid,
+                    )
+                    if distance >= 0.0:
+                        nearest_distance = min(nearest_distance, float(distance))
+        return nearest_distance
+
+    def camera_near_geometry_fraction(
+        self,
+        env,
+        camera_name: str,
+        pos: np.ndarray,
+        forward: np.ndarray,
+        up: np.ndarray,
+        fov: float,
+        near_distance: float,
+    ) -> float:
+        """Return the image fraction occupied by geometry nearer than a threshold."""
+
+        temp_name = f"_temp_near_geometry_{camera_name}"
+        temp_camera = Camera(temp_name, pos, forward, up, fov)
+        self.registry.add_camera(temp_camera)
+        try:
+            depth = env.render_depth_frame(temp_name)
+        finally:
+            del self.registry.cameras[temp_name]
+
+        valid_depth = np.isfinite(depth) & (depth > 0.0)
+        return float(np.count_nonzero(valid_depth & (depth < near_distance)) / depth.size)
+
     def setup_cameras(
         self,
         env,
@@ -843,6 +899,8 @@ class CameraManager:
         # Sample camera position
         best_pos, best_forward, best_up = None, None, None
         best_visibility_score = -1.0
+        best_geometry_clearance = np.inf
+        best_near_geometry_fraction = 0.0
 
         for attempt in range(camera_config.max_placement_attempts):
             # Sample spherical coordinates
@@ -875,6 +933,37 @@ class CameraManager:
                 env, camera_pos, np.zeros(3), lookat_target=lookat_target
             )
 
+            geometry_clearance = np.inf
+            if camera_config.min_geometry_clearance > 0:
+                geometry_clearance = self.camera_geometry_clearance(env, pos)
+                if geometry_clearance < camera_config.min_geometry_clearance:
+                    log.debug(
+                        f"[CAMERA SETUP] Rejected '{camera_config.name}' attempt "
+                        f"{attempt + 1}: {geometry_clearance:.3f}m from geometry, "
+                        f"requires {camera_config.min_geometry_clearance:.3f}m"
+                    )
+                    continue
+
+            near_geometry_fraction = 0.0
+            if camera_config.near_geometry_distance is not None:
+                near_geometry_fraction = self.camera_near_geometry_fraction(
+                    env,
+                    camera_config.name,
+                    pos,
+                    forward,
+                    up,
+                    camera_fov,
+                    camera_config.near_geometry_distance,
+                )
+                if near_geometry_fraction > camera_config.max_near_geometry_fraction:
+                    log.debug(
+                        f"[CAMERA SETUP] Rejected '{camera_config.name}' attempt "
+                        f"{attempt + 1}: {near_geometry_fraction:.1%} of the view is "
+                        f"within {camera_config.near_geometry_distance:.2f}m, allows "
+                        f"{camera_config.max_near_geometry_fraction:.1%}"
+                    )
+                    continue
+
             # Check visibility constraints if specified
             if camera_config.visibility_constraints:
                 # Resolve special visibility keys (e.g., __task_objects__, __gripper__)
@@ -906,7 +995,9 @@ class CameraManager:
                     )
                     self.add_camera(camera_config.name, pos, forward, up, camera_fov)
                     log.info(
-                        f"[CAMERA SETUP] Set up randomized exocentric camera '{camera_config.name}' (no visibility constraints)"
+                        f"[CAMERA SETUP] Set up randomized exocentric camera '{camera_config.name}' "
+                        f"(no visibility constraints, nearby geometry: "
+                        f"{near_geometry_fraction:.1%})"
                     )
                     return
 
@@ -938,6 +1029,8 @@ class CameraManager:
                     if avg_visibility > best_visibility_score:
                         best_visibility_score = avg_visibility
                         best_pos, best_forward, best_up = pos, forward, up
+                        best_geometry_clearance = geometry_clearance
+                        best_near_geometry_fraction = near_geometry_fraction
 
                     # Remove temporary camera
                     del self.registry.cameras[f"_temp_{camera_config.name}"]
@@ -947,7 +1040,9 @@ class CameraManager:
                         self.add_camera(camera_config.name, pos, forward, up, camera_fov)
                         log.info(
                             f"[CAMERA SETUP] Set up randomized exocentric camera '{camera_config.name}' "
-                            f"(attempt {attempt + 1}, visibility: {avg_visibility:.5f})"
+                            f"(attempt {attempt + 1}, visibility: {avg_visibility:.5f}, "
+                            f"geometry clearance: {geometry_clearance:.3f}m, "
+                            f"nearby geometry: {near_geometry_fraction:.1%})"
                         )
                         return
 
@@ -960,7 +1055,9 @@ class CameraManager:
                 # No visibility constraints - use first sample
                 self.add_camera(camera_config.name, pos, forward, up, camera_fov)
                 log.info(
-                    f"[CAMERA SETUP] Set up randomized exocentric camera '{camera_config.name}' (no constraints)"
+                    f"[CAMERA SETUP] Set up randomized exocentric camera '{camera_config.name}' "
+                    f"(no constraints, geometry clearance: {geometry_clearance:.3f}m, "
+                    f"nearby geometry: {near_geometry_fraction:.1%})"
                 )
                 return
 
@@ -969,7 +1066,9 @@ class CameraManager:
             self.add_camera(camera_config.name, best_pos, best_forward, best_up, camera_fov)
             log.warning(
                 f"[CAMERA SETUP] Set up exocentric camera '{camera_config.name}' with relaxed constraints "
-                f"(best visibility: {best_visibility_score:.5f})"
+                f"(best visibility: {best_visibility_score:.5f}, "
+                f"geometry clearance: {best_geometry_clearance:.3f}m, "
+                f"nearby geometry: {best_near_geometry_fraction:.1%})"
             )
         else:
             raise RuntimeError(

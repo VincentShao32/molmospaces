@@ -18,6 +18,14 @@ from mujoco import MjData, MjModel
 
 log = logging.getLogger(__name__)
 
+FAILURE_TARGET_BUCKET_NAMES = (
+    "occlusion_edge",
+    "cross_view_occlusion",
+    "object_edge",
+    "small_thin",
+    "baseline",
+)
+DEFAULT_FAILURE_TARGET_FRACTIONS = (0.20, 0.15, 0.20, 0.20, 0.25)
 DEFAULT_VISIBILITY_DEPTH_RELATIVE_TOLERANCE = 0.01
 DEFAULT_VISIBILITY_DEPTH_ABSOLUTE_TOLERANCE_M = 0.001
 RASTER_VISIBILITY_METHOD = "four_neighbor_exact_geom_depth_support_v1"
@@ -167,6 +175,56 @@ def get_trackable_body_ids(model: MjModel) -> set[int]:
     return get_object_body_ids(model) | get_robot_body_ids(model)
 
 
+def get_body_subtree_ids(model: MjModel, root_body_id: int) -> set[int]:
+    """Return one MuJoCo body and every descendant in its kinematic subtree."""
+    root_body_id = int(root_body_id)
+    if not 0 <= root_body_id < model.nbody:
+        raise ValueError(f"Invalid root body id {root_body_id} for nbody={model.nbody}")
+    body_ids: set[int] = set()
+    queue = [root_body_id]
+    while queue:
+        body_id = queue.pop()
+        if body_id in body_ids:
+            continue
+        body_ids.add(body_id)
+        queue.extend(int(child_id) for child_id in np.flatnonzero(model.body_parentid == body_id))
+    return body_ids
+
+
+def get_manipulation_target_body_ids(task) -> tuple[set[int], dict[int, str]]:
+    """Resolve the active gripper and manipulated-object body subtrees.
+
+    The pickup object is taken from ``task.config.task_config.pickup_obj_name``;
+    the gripper roots come from the robot view's registered gripper move groups.
+    Labels are returned alongside the union so saved NPZ files can verify the
+    selected target class without relying on body-name reconstruction later.
+    """
+    env = task.env
+    model = env.current_model
+    task_config = task.config.task_config
+    pickup_name = getattr(task_config, "pickup_obj_name", None)
+    if not pickup_name:
+        raise ValueError("gripper_and_pickup point targeting requires task_config.pickup_obj_name")
+
+    object_manager = env.object_managers[env.current_batch_index]
+    pickup_object = object_manager.get_object_by_name(pickup_name)
+    pickup_body_ids = {int(body_id) for body_id in pickup_object.body_ids}
+    if not pickup_body_ids:
+        raise RuntimeError(f"Pickup object {pickup_name!r} has no MuJoCo bodies")
+
+    robot_view = env.current_robot.robot_view
+    gripper_body_ids: set[int] = set()
+    for move_group_id in robot_view.get_gripper_movegroup_ids():
+        gripper_group = robot_view.get_move_group(move_group_id)
+        gripper_body_ids.update(get_body_subtree_ids(model, gripper_group.root_body_id))
+    if not gripper_body_ids:
+        raise RuntimeError("The active robot has no gripper body subtree")
+
+    labels = {body_id: "gripper" for body_id in gripper_body_ids}
+    labels.update({body_id: "manipulated_object" for body_id in pickup_body_ids})
+    return gripper_body_ids | pickup_body_ids, labels
+
+
 def get_kubric_segment_ids(
     model: MjModel,
     body_ids: np.ndarray,
@@ -193,6 +251,29 @@ def get_kubric_segment_ids(
             parent_id = int(model.body_parentid[segment_root])
         segment_ids[body_ids == body_id] = segment_root
     return segment_ids
+
+
+def get_kubric_segment_names(
+    model: MjModel,
+    segment_ids: np.ndarray,
+) -> np.ndarray:
+    """Return one durable logical-object label per Kubric-like segment ID.
+
+    Segment zero is the single collapsed background class. Foreground segment
+    IDs are logical body roots, whose MuJoCo names remain meaningful after the
+    simulator is gone and allow downstream rows to retain object membership.
+    """
+    segment_ids = np.asarray(segment_ids, dtype=np.int32)
+    names: list[str] = []
+    for segment_id in segment_ids:
+        segment_id = int(segment_id)
+        if segment_id == 0:
+            names.append("background")
+            continue
+        if not 0 < segment_id < model.nbody:
+            raise ValueError(f"Invalid logical segment id {segment_id} for nbody={model.nbody}")
+        names.append(model.body(segment_id).name or f"body_{segment_id}")
+    return np.asarray(names, dtype=str)
 
 
 def _random_phase_strided_mask(
@@ -267,6 +348,513 @@ def get_kubric_num_to_sample(
     return result
 
 
+def _logical_segment_map(
+    model: MjModel,
+    body_id_map: np.ndarray,
+    foreground_body_ids: set[int],
+) -> np.ndarray:
+    """Map a rendered body-id image to foreground instances and background 0."""
+    return get_kubric_segment_ids(
+        model,
+        np.asarray(body_id_map, dtype=np.int32).reshape(-1),
+        foreground_body_ids,
+    ).reshape(body_id_map.shape)
+
+
+def _segment_boundary_band(
+    segment_map: np.ndarray,
+    valid_mask: np.ndarray,
+    radius: int,
+) -> np.ndarray:
+    """Return valid pixels within ``radius`` pixels of a segment boundary."""
+    radius = max(0, int(radius))
+    if radius == 0:
+        return np.zeros_like(valid_mask, dtype=bool)
+
+    height, width = segment_map.shape
+    sentinel = np.iinfo(np.int32).min
+    padded = np.pad(segment_map, 1, constant_values=sentinel)
+    boundary = np.zeros_like(valid_mask, dtype=bool)
+    for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        neighbor = padded[1 + dy : 1 + dy + height, 1 + dx : 1 + dx + width]
+        boundary |= valid_mask & (neighbor != segment_map)
+
+    band = boundary.copy()
+    frontier = boundary
+    for _ in range(1, radius):
+        padded_frontier = np.pad(frontier, 1, constant_values=False)
+        expanded = np.zeros_like(valid_mask, dtype=bool)
+        for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            expanded |= padded_frontier[
+                1 + dy : 1 + dy + height,
+                1 + dx : 1 + dx + width,
+            ]
+        frontier = expanded & valid_mask & ~band
+        band |= frontier
+    return band
+
+
+def candidate_mask_context_features(
+    segment_map: np.ndarray,
+    query_points: np.ndarray,
+    segment_ids: np.ndarray,
+    *,
+    local_radius_px: int = 4,
+    max_edge_distance_px: int = 4,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Measure projected segment area, local support, and silhouette distance.
+
+    ``query_points`` follows Kubric ``[t, y, x]`` ordering. Distances are measured
+    from each candidate's pixel to the nearest pixel with a different logical
+    segment id, up to ``max_edge_distance_px``. Values above that search radius
+    are returned as ``max_edge_distance_px + 1``.
+    """
+    segment_map = np.asarray(segment_map, dtype=np.int32)
+    query_points = np.asarray(query_points)
+    segment_ids = np.asarray(segment_ids, dtype=np.int32)
+    if segment_map.ndim != 2:
+        raise ValueError("segment_map must be two-dimensional")
+    if query_points.ndim != 2 or query_points.shape[1] != 3:
+        raise ValueError("query_points must have shape (N, 3) in [t, y, x] order")
+    if len(query_points) != len(segment_ids):
+        raise ValueError("query_points and segment_ids must align")
+
+    n_points = len(segment_ids)
+    height, width = segment_map.shape
+    ys = np.floor(query_points[:, 1]).astype(np.int64)
+    xs = np.floor(query_points[:, 2]).astype(np.int64)
+    center_valid = (ys >= 0) & (ys < height) & (xs >= 0) & (xs < width)
+
+    unique_segments, counts = np.unique(segment_map, return_counts=True)
+    area_lookup = {
+        int(segment_id): float(count) / float(segment_map.size)
+        for segment_id, count in zip(unique_segments, counts)
+    }
+    area_fraction = np.fromiter(
+        (area_lookup.get(int(segment_id), 0.0) for segment_id in segment_ids),
+        dtype=np.float32,
+        count=n_points,
+    )
+
+    local_radius = max(0, int(local_radius_px))
+    edge_radius = max(0, int(max_edge_distance_px))
+    search_radius = max(local_radius, edge_radius)
+    same_count = np.zeros(n_points, dtype=np.int32)
+    local_count = np.zeros(n_points, dtype=np.int32)
+    edge_distance_sq = np.full(n_points, np.inf, dtype=np.float32)
+
+    for dy in range(-search_radius, search_radius + 1):
+        for dx in range(-search_radius, search_radius + 1):
+            neighbor_y = ys + dy
+            neighbor_x = xs + dx
+            valid = (
+                center_valid
+                & (neighbor_y >= 0)
+                & (neighbor_y < height)
+                & (neighbor_x >= 0)
+                & (neighbor_x < width)
+            )
+            if not np.any(valid):
+                continue
+            neighbor_segments = np.zeros(n_points, dtype=np.int32)
+            neighbor_segments[valid] = segment_map[neighbor_y[valid], neighbor_x[valid]]
+            same = valid & (neighbor_segments == segment_ids)
+            if abs(dy) <= local_radius and abs(dx) <= local_radius:
+                local_count += valid
+                same_count += same
+            distance_sq = dx * dx + dy * dy
+            if 0 < distance_sq <= edge_radius * edge_radius:
+                different = valid & ~same
+                edge_distance_sq[different] = np.minimum(
+                    edge_distance_sq[different], float(distance_sq)
+                )
+
+    local_support = np.divide(
+        same_count,
+        np.maximum(local_count, 1),
+        dtype=np.float32,
+    )
+    edge_distance = np.full(n_points, float(edge_radius + 1), dtype=np.float32)
+    found_edge = np.isfinite(edge_distance_sq)
+    edge_distance[found_edge] = np.sqrt(edge_distance_sq[found_edge])
+    return area_fraction, local_support, edge_distance
+
+
+def _balanced_sample_without_replacement(
+    candidate_indices: np.ndarray,
+    segment_ids: np.ndarray,
+    count: int,
+    rng: np.random.RandomState,
+    sample_weights: np.ndarray | None = None,
+) -> np.ndarray:
+    """Sample without replacement while distributing budget across segments.
+
+    Optional weights are divided by their segment's candidate count. Equal
+    weights therefore retain segment-balanced behavior, while nonuniform weights
+    can softly prioritize candidates without letting large segments dominate.
+    """
+    candidate_indices = np.asarray(candidate_indices, dtype=np.int64)
+    if count <= 0 or len(candidate_indices) == 0:
+        return np.zeros(0, dtype=np.int64)
+    count = min(int(count), len(candidate_indices))
+    pool_segments = np.asarray(segment_ids, dtype=np.int32)[candidate_indices]
+    if sample_weights is not None:
+        sample_weights = np.asarray(sample_weights, dtype=np.float64)
+        if len(sample_weights) != len(segment_ids):
+            raise ValueError("sample_weights must align with segment_ids")
+        pool_weights = sample_weights[candidate_indices]
+        _, inverse, segment_counts = np.unique(
+            pool_segments, return_inverse=True, return_counts=True
+        )
+        pool_weights = np.divide(
+            pool_weights,
+            segment_counts[inverse],
+            out=np.zeros_like(pool_weights),
+            where=segment_counts[inverse] > 0,
+        )
+        pool_weights = np.nan_to_num(pool_weights, nan=0.0, posinf=0.0, neginf=0.0)
+        pool_weights = np.maximum(pool_weights, np.finfo(np.float64).tiny)
+        pool_weights /= pool_weights.sum()
+        return rng.choice(
+            candidate_indices,
+            size=count,
+            replace=False,
+            p=pool_weights,
+        )
+
+    unique_segments, segment_counts = np.unique(pool_segments, return_counts=True)
+    allocations = get_kubric_num_to_sample(segment_counts, 1.0, count)
+    selected_parts: list[np.ndarray] = []
+    for segment_id, allocation in zip(unique_segments, allocations):
+        if allocation <= 0:
+            continue
+        segment_pool = candidate_indices[pool_segments == segment_id]
+        selected_parts.append(rng.choice(segment_pool, size=int(allocation), replace=False))
+    selected = np.concatenate(selected_parts) if selected_parts else np.zeros(0, dtype=np.int64)
+    if len(selected) < count:
+        remaining = np.setdiff1d(candidate_indices, selected, assume_unique=False)
+        selected = np.concatenate(
+            [
+                selected,
+                rng.choice(remaining, size=count - len(selected), replace=False),
+            ]
+        )
+    rng.shuffle(selected)
+    return selected
+
+
+def select_failure_targeted_cross_view_shortlist_indices(
+    segment_ids: np.ndarray,
+    source_cameras: np.ndarray,
+    source_edge_distance_px: np.ndarray,
+    source_segment_area_fraction: np.ndarray,
+    source_local_segment_support: np.ndarray,
+    *,
+    max_candidates: int,
+    seed: int,
+    edge_distance_px: float = 4.0,
+    small_segment_area_fraction: float = 0.02,
+    local_support_threshold: float = 0.60,
+    priority_fraction: float = 0.40,
+    prioritize_edges: bool = True,
+    target_labels: np.ndarray | None = None,
+) -> np.ndarray:
+    """Shortlist cheap source-view features before exact cross-view scoring.
+
+    The shortlist is balanced over source-camera/logical-segment groups. A
+    fixed share is first reserved for small/thin candidates and, when enabled,
+    object-edge candidates. The remainder comes from non-priority candidates so
+    likely cross-view occlusions and baseline controls retain broad coverage.
+    Target labels, when present, are included in the balancing groups.
+    """
+    segment_ids = np.asarray(segment_ids, dtype=np.int32)
+    source_cameras = np.asarray(source_cameras, dtype=str)
+    source_edge_distance_px = np.asarray(source_edge_distance_px, dtype=np.float32)
+    source_segment_area_fraction = np.asarray(source_segment_area_fraction, dtype=np.float32)
+    source_local_segment_support = np.asarray(source_local_segment_support, dtype=np.float32)
+    n_candidates = len(segment_ids)
+    feature_arrays = (
+        source_cameras,
+        source_edge_distance_px,
+        source_segment_area_fraction,
+        source_local_segment_support,
+    )
+    if any(len(values) != n_candidates for values in feature_arrays):
+        raise ValueError("Cross-view shortlist feature arrays must align")
+    if max_candidates < 1:
+        raise ValueError("max_candidates must be positive")
+    if not 0.0 <= priority_fraction <= 1.0:
+        raise ValueError("priority_fraction must be in [0, 1]")
+
+    label_codes = None
+    if target_labels is not None:
+        target_labels = np.asarray(target_labels, dtype=str)
+        if len(target_labels) != n_candidates:
+            raise ValueError("target_labels must align with segment_ids")
+        _, label_codes = np.unique(target_labels, return_inverse=True)
+
+    if n_candidates <= max_candidates:
+        return np.arange(n_candidates, dtype=np.int64)
+
+    _, camera_codes = np.unique(source_cameras, return_inverse=True)
+    group_columns = [camera_codes, segment_ids]
+    if label_codes is not None:
+        group_columns.append(label_codes)
+    group_keys = np.column_stack(group_columns)
+    _, group_ids = np.unique(group_keys, axis=0, return_inverse=True)
+    group_ids = np.asarray(group_ids, dtype=np.int32)
+
+    foreground = segment_ids != 0
+    priority_mask = foreground & (
+        (source_segment_area_fraction <= float(small_segment_area_fraction))
+        | (source_local_segment_support <= float(local_support_threshold))
+    )
+    if prioritize_edges:
+        priority_mask |= foreground & (source_edge_distance_px <= float(edge_distance_px))
+    rng = np.random.RandomState(seed)
+    priority_target = min(
+        int(round(max_candidates * priority_fraction)),
+        int(priority_mask.sum()),
+    )
+    priority_selected = _balanced_sample_without_replacement(
+        np.flatnonzero(priority_mask),
+        group_ids,
+        priority_target,
+        rng,
+    )
+
+    chosen = np.zeros(n_candidates, dtype=bool)
+    chosen[priority_selected] = True
+    remaining_target = max_candidates - len(priority_selected)
+    broad_selected = _balanced_sample_without_replacement(
+        np.flatnonzero(~priority_mask & ~chosen),
+        group_ids,
+        remaining_target,
+        rng,
+    )
+    chosen[broad_selected] = True
+
+    selected = np.concatenate([priority_selected, broad_selected])
+    if len(selected) < max_candidates:
+        fill_selected = _balanced_sample_without_replacement(
+            np.flatnonzero(~chosen),
+            group_ids,
+            max_candidates - len(selected),
+            rng,
+        )
+        selected = np.concatenate([selected, fill_selected])
+    rng.shuffle(selected)
+    return np.asarray(selected, dtype=np.int64)
+
+
+def depth_penalized_size_features(
+    projected_area_fraction: np.ndarray,
+    local_segment_support: np.ndarray,
+    source_depth_m: np.ndarray,
+    *,
+    reference_depth_m: float = 1.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Correct image-space size cues that otherwise favor distant surfaces.
+
+    Perspective makes projected area fall approximately with depth squared and
+    projected thickness fall approximately linearly with depth. Candidates at
+    or closer than ``reference_depth_m`` are left unchanged. Beyond it, area is
+    multiplied by the squared relative depth and local support by relative
+    depth. This is intentionally a soft penalty rather than a maximum-depth
+    cutoff, so genuinely small or thin distant objects can still qualify.
+    """
+    if reference_depth_m <= 0:
+        raise ValueError("reference_depth_m must be positive")
+    projected_area_fraction = np.asarray(projected_area_fraction, dtype=np.float32)
+    local_segment_support = np.asarray(local_segment_support, dtype=np.float32)
+    source_depth_m = np.asarray(source_depth_m, dtype=np.float32)
+    if not (len(projected_area_fraction) == len(local_segment_support) == len(source_depth_m)):
+        raise ValueError("Depth-penalized size feature arrays must align")
+
+    depth_scale = np.full(len(source_depth_m), np.inf, dtype=np.float32)
+    valid_depth = np.isfinite(source_depth_m) & (source_depth_m > 0)
+    depth_scale[valid_depth] = np.maximum(
+        1.0, source_depth_m[valid_depth] / float(reference_depth_m)
+    )
+    adjusted_area = projected_area_fraction * np.square(depth_scale)
+    adjusted_support = np.minimum(1.0, local_segment_support * depth_scale)
+    return adjusted_area.astype(np.float32), adjusted_support.astype(np.float32)
+
+
+def soft_depth_sampling_weights(
+    source_depth_m: np.ndarray,
+    *,
+    reference_depth_m: float = 1.0,
+    minimum_weight: float = 0.10,
+) -> np.ndarray:
+    """Return inverse-square depth weights with a nonzero distant-point floor."""
+    if reference_depth_m <= 0:
+        raise ValueError("reference_depth_m must be positive")
+    if not 0.0 <= minimum_weight <= 1.0:
+        raise ValueError("minimum_weight must be in [0, 1]")
+    source_depth_m = np.asarray(source_depth_m, dtype=np.float32)
+    depth_scale = np.ones(len(source_depth_m), dtype=np.float32)
+    valid_depth = np.isfinite(source_depth_m) & (source_depth_m > 0)
+    depth_scale[valid_depth] = np.maximum(
+        1.0, source_depth_m[valid_depth] / float(reference_depth_m)
+    )
+    weights = minimum_weight + (1.0 - minimum_weight) / np.square(depth_scale)
+    weights[~valid_depth] = minimum_weight
+    return weights.astype(np.float32)
+
+
+def select_failure_targeted_candidate_indices(
+    segment_ids: np.ndarray,
+    source_edge_distance_px: np.ndarray,
+    source_segment_area_fraction: np.ndarray,
+    source_local_segment_support: np.ndarray,
+    visibility_by_camera: np.ndarray,
+    in_frame_by_camera: np.ndarray,
+    occluder_edge_distance_px: np.ndarray,
+    *,
+    max_points: int,
+    seed: int,
+    target_fractions: tuple[float, ...] = DEFAULT_FAILURE_TARGET_FRACTIONS,
+    edge_distance_px: float = 4.0,
+    minimum_source_edge_distance_px: float = 2.0,
+    small_segment_area_fraction: float = 0.02,
+    local_support_threshold: float = 0.60,
+    source_depth_m: np.ndarray | None = None,
+    depth_penalty_reference_m: float = 1.0,
+    depth_sampling_min_weight: float = 0.10,
+) -> tuple[np.ndarray, np.ndarray, dict[str, int]]:
+    """Select a balanced mixture of occlusion, edge, small/thin, and controls.
+
+    Candidates closer than ``minimum_source_edge_distance_px`` to their logical
+    segment boundary are ineligible for every bucket. The object-edge bucket
+    therefore samples a safe annulus between that minimum inset and
+    ``edge_distance_px``. When source depths are provided, small/thin eligibility
+    uses depth-penalized area and support, and all four targeted buckets use soft
+    inverse-depth sampling weights. The weights have a nonzero floor and the
+    baseline quota is unweighted, so distant background coverage is retained.
+    """
+    segment_ids = np.asarray(segment_ids, dtype=np.int32)
+    n_candidates = len(segment_ids)
+    feature_arrays = (
+        source_edge_distance_px,
+        source_segment_area_fraction,
+        source_local_segment_support,
+        occluder_edge_distance_px,
+    )
+    if any(len(np.asarray(value)) != n_candidates for value in feature_arrays):
+        raise ValueError("Failure-targeted feature arrays must align with segment_ids")
+    visibility_by_camera = np.asarray(visibility_by_camera, dtype=bool)
+    in_frame_by_camera = np.asarray(in_frame_by_camera, dtype=bool)
+    if visibility_by_camera.shape != in_frame_by_camera.shape:
+        raise ValueError("visibility_by_camera and in_frame_by_camera must align")
+    if visibility_by_camera.ndim != 2 or visibility_by_camera.shape[1] != n_candidates:
+        raise ValueError("camera visibility arrays must have shape (C, N)")
+    if len(target_fractions) != len(FAILURE_TARGET_BUCKET_NAMES):
+        raise ValueError(f"target_fractions must have {len(FAILURE_TARGET_BUCKET_NAMES)} values")
+    if minimum_source_edge_distance_px < 0:
+        raise ValueError("minimum_source_edge_distance_px must be non-negative")
+    if minimum_source_edge_distance_px > edge_distance_px:
+        raise ValueError("minimum_source_edge_distance_px must not exceed edge_distance_px")
+    fractions = np.asarray(target_fractions, dtype=np.float64)
+    if np.any(fractions < 0) or not np.isclose(fractions.sum(), 1.0):
+        raise ValueError("target_fractions must be non-negative and sum to 1")
+    if max_points <= 0 or n_candidates == 0:
+        return (
+            np.zeros(0, dtype=np.int64),
+            np.zeros(0, dtype="<U24"),
+            {name: 0 for name in FAILURE_TARGET_BUCKET_NAMES},
+        )
+
+    source_edge_distance_px = np.asarray(source_edge_distance_px, dtype=np.float32)
+    safe_source_inset = source_edge_distance_px >= float(minimum_source_edge_distance_px)
+    if not np.any(safe_source_inset):
+        raise RuntimeError(
+            "No failure-targeted candidates remain after applying the minimum "
+            f"source edge inset of {minimum_source_edge_distance_px:g} px"
+        )
+
+    foreground = segment_ids != 0
+    in_frame_occluded = np.any(in_frame_by_camera & ~visibility_by_camera, axis=0)
+    adjusted_area = np.asarray(source_segment_area_fraction, dtype=np.float32)
+    adjusted_support = np.asarray(source_local_segment_support, dtype=np.float32)
+    depth_sample_weights = None
+    if source_depth_m is not None:
+        if len(np.asarray(source_depth_m)) != n_candidates:
+            raise ValueError("source_depth_m must align with segment_ids")
+        adjusted_area, adjusted_support = depth_penalized_size_features(
+            adjusted_area,
+            adjusted_support,
+            source_depth_m,
+            reference_depth_m=depth_penalty_reference_m,
+        )
+        depth_sample_weights = soft_depth_sampling_weights(
+            source_depth_m,
+            reference_depth_m=depth_penalty_reference_m,
+            minimum_weight=depth_sampling_min_weight,
+        )
+    masks = {
+        "occlusion_edge": safe_source_inset
+        & in_frame_occluded
+        & (np.asarray(occluder_edge_distance_px) <= edge_distance_px),
+        "cross_view_occlusion": safe_source_inset & in_frame_occluded,
+        "object_edge": safe_source_inset
+        & foreground
+        & (source_edge_distance_px <= edge_distance_px),
+        "small_thin": safe_source_inset
+        & foreground
+        & (
+            (adjusted_area <= small_segment_area_fraction)
+            | (adjusted_support <= local_support_threshold)
+        ),
+        "baseline": safe_source_inset,
+    }
+    candidate_counts = {name: int(mask.sum()) for name, mask in masks.items()}
+
+    raw_targets = fractions * int(max_points)
+    targets = np.floor(raw_targets).astype(np.int64)
+    for index in np.argsort(-(raw_targets - targets))[: int(max_points) - int(targets.sum())]:
+        targets[index] += 1
+
+    rng = np.random.RandomState(seed)
+    chosen = np.zeros(n_candidates, dtype=bool)
+    selected_parts: list[np.ndarray] = []
+    bucket_parts: list[np.ndarray] = []
+    for bucket_name, target in zip(FAILURE_TARGET_BUCKET_NAMES[:-1], targets[:-1]):
+        pool = np.flatnonzero(masks[bucket_name] & ~chosen)
+        picked = _balanced_sample_without_replacement(
+            pool,
+            segment_ids,
+            int(target),
+            rng,
+            sample_weights=depth_sample_weights,
+        )
+        chosen[picked] = True
+        selected_parts.append(picked)
+        bucket_parts.append(np.full(len(picked), bucket_name, dtype="<U24"))
+
+    selected_count = sum(len(part) for part in selected_parts)
+    baseline_pool = np.flatnonzero(masks["baseline"] & ~chosen)
+    baseline_picked = _balanced_sample_without_replacement(
+        baseline_pool,
+        segment_ids,
+        min(int(max_points) - selected_count, len(baseline_pool)),
+        rng,
+    )
+    chosen[baseline_picked] = True
+    selected_parts.append(baseline_picked)
+    bucket_parts.append(np.full(len(baseline_picked), "baseline", dtype="<U24"))
+
+    selected = np.concatenate(selected_parts)
+    buckets = np.concatenate(bucket_parts)
+    if len(selected) < max_points:
+        repeat_pool = selected if len(selected) else np.arange(n_candidates)
+        repeated = rng.choice(repeat_pool, size=max_points - len(selected), replace=True)
+        selected = np.concatenate([selected, repeated])
+        buckets = np.concatenate([buckets, np.full(len(repeated), "fallback_repeat", dtype="<U24")])
+    order = rng.permutation(len(selected))
+    return selected[order], buckets[order], candidate_counts
+
+
 def sample_kubric_candidates_from_image(
     model: MjModel,
     data: MjData,
@@ -280,6 +868,7 @@ def sample_kubric_candidates_from_image(
     spatial_phase: tuple[int, int] = (0, 0),
     object_body_ids: set[int] | None = None,
     include_background: bool = False,
+    dense_boundary_radius_px: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Extract all eligible candidates on one slice of Kubric's 3D grid.
 
@@ -312,7 +901,18 @@ def sample_kubric_candidates_from_image(
         spatial_phase[0],
         spatial_phase[1],
     )
-    valid_mask = _apply_strided_mask(valid_mask, grid_mask)
+    if dense_boundary_radius_px > 0:
+        foreground_body_ids = object_body_ids
+        if foreground_body_ids is None:
+            foreground_body_ids = {
+                int(body_id) for body_id in np.unique(body_id_map) if body_id > 0
+            }
+        segment_map = _logical_segment_map(model, body_id_map, foreground_body_ids)
+        boundary_band = _segment_boundary_band(segment_map, valid_mask, dense_boundary_radius_px)
+        if grid_mask is not None:
+            valid_mask &= grid_mask | boundary_band
+    else:
+        valid_mask = _apply_strided_mask(valid_mask, grid_mask)
     pys, pxs = np.where(valid_mask)
     if len(pys) == 0:
         return (
@@ -775,6 +1375,854 @@ def _build_camera_matrices(camera, img_width: int, img_height: int):
     intrinsics = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32)
 
     return world2cam, intrinsics
+
+
+def _occluder_edge_distances(
+    segment_map: np.ndarray,
+    points_2d: np.ndarray,
+    occluded_mask: np.ndarray,
+    max_edge_distance_px: int,
+) -> np.ndarray:
+    """Measure distance to the rendered occluder's silhouette for occluded points."""
+    points_2d = np.asarray(points_2d)
+    occluded_mask = np.asarray(occluded_mask, dtype=bool)
+    result = np.full(len(points_2d), float(max_edge_distance_px + 1), dtype=np.float32)
+    selected = np.flatnonzero(occluded_mask)
+    if len(selected) == 0:
+        return result
+    xs = np.floor(points_2d[selected, 0]).astype(np.int64)
+    ys = np.floor(points_2d[selected, 1]).astype(np.int64)
+    height, width = segment_map.shape
+    valid = (ys >= 0) & (ys < height) & (xs >= 0) & (xs < width)
+    selected = selected[valid]
+    xs = xs[valid]
+    ys = ys[valid]
+    if len(selected) == 0:
+        return result
+    rendered_segments = segment_map[ys, xs]
+    query_points = np.column_stack(
+        [
+            np.zeros(len(selected), dtype=np.float32),
+            points_2d[selected, 1],
+            points_2d[selected, 0],
+        ]
+    )
+    _, _, edge_distance = candidate_mask_context_features(
+        segment_map,
+        query_points,
+        rendered_segments,
+        local_radius_px=0,
+        max_edge_distance_px=max_edge_distance_px,
+    )
+    result[selected] = edge_distance
+    return result
+
+
+def _unproject_depth_pixels(
+    depth: np.ndarray,
+    xs: np.ndarray,
+    ys: np.ndarray,
+    intrinsics: np.ndarray,
+) -> np.ndarray:
+    """Unproject raster pixel centers into the camera's CV coordinate frame."""
+    z = np.asarray(depth[ys, xs], dtype=np.float64)
+    x = (xs.astype(np.float64) + 0.5 - intrinsics[0, 2]) / intrinsics[0, 0] * z
+    y = (ys.astype(np.float64) + 0.5 - intrinsics[1, 2]) / intrinsics[1, 1] * z
+    return np.column_stack((x, y, z))
+
+
+def _depth_surface_normals_for_camera(
+    depth: np.ndarray,
+    segmentation: np.ndarray,
+    query_points: np.ndarray,
+    geom_ids: np.ndarray,
+    camera,
+    img_width: int,
+    img_height: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Estimate normals from exact-geom horizontal and vertical depth tangents."""
+    count = len(query_points)
+    normals_world = np.full((count, 3), np.nan, dtype=np.float64)
+    valid = np.zeros(count, dtype=bool)
+    if count == 0:
+        return normals_world.astype(np.float32), valid
+
+    xs = np.floor(query_points[:, 2]).astype(np.int64)
+    ys = np.floor(query_points[:, 1]).astype(np.int64)
+    height, width = depth.shape
+    inside = (xs > 0) & (xs + 1 < width) & (ys > 0) & (ys + 1 < height)
+    selected = np.flatnonzero(inside)
+    if len(selected) == 0:
+        return normals_world.astype(np.float32), valid
+
+    sx, sy = xs[selected], ys[selected]
+    wanted_geom = geom_ids[selected]
+    geom_map = np.asarray(segmentation[:, :, 0], dtype=np.int32)
+    center_ok = geom_map[sy, sx] == wanted_geom
+    left_ok = geom_map[sy, sx - 1] == wanted_geom
+    right_ok = geom_map[sy, sx + 1] == wanted_geom
+    up_ok = geom_map[sy - 1, sx] == wanted_geom
+    down_ok = geom_map[sy + 1, sx] == wanted_geom
+    finite_center = np.isfinite(depth[sy, sx]) & (depth[sy, sx] > 0)
+    finite_left = np.isfinite(depth[sy, sx - 1]) & (depth[sy, sx - 1] > 0)
+    finite_right = np.isfinite(depth[sy, sx + 1]) & (depth[sy, sx + 1] > 0)
+    finite_up = np.isfinite(depth[sy - 1, sx]) & (depth[sy - 1, sx] > 0)
+    finite_down = np.isfinite(depth[sy + 1, sx]) & (depth[sy + 1, sx] > 0)
+    left_ok &= finite_left
+    right_ok &= finite_right
+    up_ok &= finite_up
+    down_ok &= finite_down
+    usable = center_ok & finite_center & (left_ok | right_ok) & (up_ok | down_ok)
+    selected = selected[usable]
+    if len(selected) == 0:
+        return normals_world.astype(np.float32), valid
+
+    sx, sy = xs[selected], ys[selected]
+    local = np.flatnonzero(usable)
+    _, intrinsics = _build_camera_matrices(camera, img_width, img_height)
+    center = _unproject_depth_pixels(depth, sx, sy, intrinsics)
+    tangent_x = np.empty_like(center)
+    tangent_y = np.empty_like(center)
+    both_x = left_ok[local] & right_ok[local]
+    both_y = up_ok[local] & down_ok[local]
+    if np.any(both_x):
+        tangent_x[both_x] = _unproject_depth_pixels(
+            depth, sx[both_x] + 1, sy[both_x], intrinsics
+        ) - _unproject_depth_pixels(depth, sx[both_x] - 1, sy[both_x], intrinsics)
+    if np.any(~both_x):
+        use_right = right_ok[local][~both_x]
+        other_x = sx[~both_x] + np.where(use_right, 1, -1)
+        other = _unproject_depth_pixels(depth, other_x, sy[~both_x], intrinsics)
+        tangent_x[~both_x] = np.where(
+            use_right[:, None], other - center[~both_x], center[~both_x] - other
+        )
+    if np.any(both_y):
+        tangent_y[both_y] = _unproject_depth_pixels(
+            depth, sx[both_y], sy[both_y] + 1, intrinsics
+        ) - _unproject_depth_pixels(depth, sx[both_y], sy[both_y] - 1, intrinsics)
+    if np.any(~both_y):
+        use_down = down_ok[local][~both_y]
+        other_y = sy[~both_y] + np.where(use_down, 1, -1)
+        other = _unproject_depth_pixels(depth, sx[~both_y], other_y, intrinsics)
+        tangent_y[~both_y] = np.where(
+            use_down[:, None], other - center[~both_y], center[~both_y] - other
+        )
+
+    normals_camera = np.cross(tangent_x, tangent_y)
+    lengths = np.linalg.norm(normals_camera, axis=1)
+    good = np.isfinite(normals_camera).all(axis=1) & (lengths > 1e-10)
+    normals_camera[good] /= lengths[good, None]
+    cam2world = np.asarray(camera.get_pose(), dtype=np.float64)
+    converted = normals_camera @ cam2world[:3, :3].T
+    normals_world[selected[good]] = converted[good]
+    valid[selected[good]] = True
+    return normals_world.astype(np.float32), valid
+
+
+def _geometry_surface_normals(
+    model: MjModel,
+    data: MjData,
+    world_points: np.ndarray,
+    geom_ids: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute analytic primitive or nearest-triangle normals for MuJoCo geoms."""
+    normals = np.full((len(world_points), 3), np.nan, dtype=np.float64)
+    valid = np.zeros(len(world_points), dtype=bool)
+    methods = np.full(len(world_points), "unavailable", dtype="<U32")
+    mesh_cache = {}
+    for geom_id in np.unique(geom_ids):
+        rows = np.flatnonzero(geom_ids == geom_id)
+        rotation = np.asarray(data.geom_xmat[geom_id], dtype=np.float64).reshape(3, 3)
+        position = np.asarray(data.geom_xpos[geom_id], dtype=np.float64)
+        local_points = (world_points[rows] - position) @ rotation
+        geom_type = int(model.geom_type[geom_id])
+        size = np.maximum(np.asarray(model.geom_size[geom_id], dtype=np.float64), 1e-12)
+        local_normals = np.full_like(local_points, np.nan)
+        method = "primitive_analytic"
+
+        if geom_type == mujoco.mjtGeom.mjGEOM_PLANE.value:
+            local_normals[:] = (0.0, 0.0, 1.0)
+        elif geom_type == mujoco.mjtGeom.mjGEOM_SPHERE.value:
+            local_normals = local_points
+        elif geom_type == mujoco.mjtGeom.mjGEOM_ELLIPSOID.value:
+            local_normals = local_points / (size**2)
+        elif geom_type == mujoco.mjtGeom.mjGEOM_BOX.value:
+            face_score = np.abs(local_points) / size
+            axes = np.argmax(face_score, axis=1)
+            local_normals[:] = 0.0
+            local_normals[np.arange(len(rows)), axes] = np.where(
+                local_points[np.arange(len(rows)), axes] >= 0, 1.0, -1.0
+            )
+        elif geom_type in {
+            mujoco.mjtGeom.mjGEOM_CYLINDER.value,
+            mujoco.mjtGeom.mjGEOM_CAPSULE.value,
+        }:
+            radial = np.linalg.norm(local_points[:, :2], axis=1)
+            if geom_type == mujoco.mjtGeom.mjGEOM_CYLINDER.value:
+                on_cap = np.abs(np.abs(local_points[:, 2]) - size[1]) < np.abs(radial - size[0])
+                local_normals[:, :2] = local_points[:, :2]
+                local_normals[:, 2] = 0.0
+                local_normals[on_cap] = 0.0
+                local_normals[on_cap, 2] = np.where(local_points[on_cap, 2] >= 0, 1.0, -1.0)
+            else:
+                cap_center_z = np.clip(local_points[:, 2], -size[1], size[1])
+                local_normals = local_points - np.column_stack(
+                    (np.zeros(len(rows)), np.zeros(len(rows)), cap_center_z)
+                )
+        elif geom_type == mujoco.mjtGeom.mjGEOM_MESH.value:
+            try:
+                import trimesh
+
+                mesh_id = int(model.geom_dataid[geom_id])
+                if mesh_id not in mesh_cache:
+                    vertex_start = int(model.mesh_vertadr[mesh_id])
+                    vertex_count = int(model.mesh_vertnum[mesh_id])
+                    face_start = int(model.mesh_faceadr[mesh_id])
+                    face_count = int(model.mesh_facenum[mesh_id])
+                    mesh_cache[mesh_id] = trimesh.Trimesh(
+                        vertices=np.asarray(
+                            model.mesh_vert[vertex_start : vertex_start + vertex_count]
+                        ),
+                        faces=np.asarray(model.mesh_face[face_start : face_start + face_count]),
+                        process=False,
+                    )
+                mesh = mesh_cache[mesh_id]
+                _, _, face_ids = mesh.nearest.on_surface(local_points)
+                local_normals = np.asarray(mesh.face_normals[face_ids], dtype=np.float64)
+                method = "mesh_nearest_face"
+            except Exception as exc:
+                log.warning("Could not compute mesh normals for geom %d: %s", geom_id, exc)
+        else:
+            log.warning("No geometry normal implementation for MuJoCo geom type %d", geom_type)
+
+        lengths = np.linalg.norm(local_normals, axis=1)
+        good = np.isfinite(local_normals).all(axis=1) & (lengths > 1e-10)
+        local_normals[good] /= lengths[good, None]
+        normals[rows[good]] = local_normals[good] @ rotation.T
+        valid[rows[good]] = True
+        methods[rows[good]] = method
+    return normals.astype(np.float32), valid, methods
+
+
+def estimate_aligned_surface_normals(
+    model: MjModel,
+    data: MjData,
+    camera_names: list[str] | tuple[str, ...],
+    camera_registry,
+    rendered_depths: dict[str, np.ndarray],
+    rendered_segmentations: dict[str, np.ndarray],
+    query_points: np.ndarray,
+    source_cameras: np.ndarray,
+    world_points: np.ndarray,
+    body_ids: np.ndarray,
+    geom_ids: np.ndarray,
+    img_width: int,
+    img_height: int,
+) -> dict[str, np.ndarray]:
+    """Estimate one oriented surface normal for every selected physical point."""
+    count = len(world_points)
+    world_normals = np.full((count, 3), np.nan, dtype=np.float32)
+    methods = np.full(count, "unavailable", dtype="<U32")
+    resolved = np.zeros(count, dtype=bool)
+    for camera_name in camera_names:
+        rows = np.flatnonzero(source_cameras == camera_name)
+        depth_normals, valid = _depth_surface_normals_for_camera(
+            rendered_depths[camera_name],
+            rendered_segmentations[camera_name],
+            query_points[rows],
+            geom_ids[rows],
+            camera_registry[camera_name],
+            img_width,
+            img_height,
+        )
+        world_normals[rows[valid]] = depth_normals[valid]
+        resolved[rows[valid]] = True
+        methods[rows[valid]] = "rendered_depth_exact_geom"
+
+    if not np.all(resolved):
+        missing = np.flatnonzero(~resolved)
+        fallback, valid, fallback_methods = _geometry_surface_normals(
+            model, data, world_points[missing], geom_ids[missing]
+        )
+        world_normals[missing[valid]] = fallback[valid]
+        resolved[missing[valid]] = True
+        methods[missing[valid]] = fallback_methods[valid]
+    if not np.all(resolved):
+        missing_geoms = np.unique(geom_ids[~resolved]).tolist()
+        raise RuntimeError(
+            f"Could not compute surface normals for {(~resolved).sum()} points "
+            f"on geoms {missing_geoms}"
+        )
+
+    # Resolve the normal sign consistently: point toward its query camera.
+    camera_normals = np.empty_like(world_normals)
+    for camera_name in camera_names:
+        rows = np.flatnonzero(source_cameras == camera_name)
+        cam2world = np.asarray(camera_registry[camera_name].get_pose(), dtype=np.float64)
+        toward_camera = cam2world[:3, 3] - world_points[rows]
+        flip = np.sum(world_normals[rows] * toward_camera, axis=1) < 0
+        world_normals[rows[flip]] *= -1.0
+        world2cam = np.linalg.inv(cam2world)
+        camera_normals[rows] = world_normals[rows] @ world2cam[:3, :3].T
+
+    local_normals = np.empty_like(world_normals)
+    for body_id in np.unique(body_ids):
+        rows = np.flatnonzero(body_ids == body_id)
+        body_rotation = np.asarray(data.xmat[body_id], dtype=np.float64).reshape(3, 3)
+        local_normals[rows] = world_normals[rows] @ body_rotation
+
+    for values, name in (
+        (world_normals, "world"),
+        (local_normals, "body-local"),
+        (camera_normals, "query-camera"),
+    ):
+        lengths = np.linalg.norm(values, axis=1)
+        if not np.isfinite(values).all() or not np.allclose(lengths, 1.0, atol=2e-4):
+            raise RuntimeError(f"Generated invalid {name} surface normals")
+    method_names, method_counts = np.unique(methods, return_counts=True)
+    return {
+        "normals_3d": world_normals.astype(np.float32),
+        "local_normals": local_normals.astype(np.float32),
+        "query_source_camera_normals": camera_normals.astype(np.float32),
+        "surface_normal_methods": methods,
+        "surface_normal_method_names": method_names,
+        "surface_normal_method_counts": method_counts.astype(np.int64),
+    }
+
+
+def sample_aligned_kubric_points_for_frame(
+    env,
+    camera_names: list[str] | tuple[str, ...],
+    img_width: int,
+    img_height: int,
+    max_points: int = 1000,
+    seed: int = 0,
+    sampling_stride: int = 4,
+    max_sampled_fraction: float = 0.1,
+    include_background: bool = True,
+    sampling_mode: str = "kubric",
+    failure_target_fractions: tuple[float, ...] = DEFAULT_FAILURE_TARGET_FRACTIONS,
+    failure_edge_distance_px: float = 4.0,
+    failure_min_source_edge_distance_px: float = 2.0,
+    failure_max_cross_view_candidates: int = 15_000,
+    failure_shortlist_prioritize_edges: bool = True,
+    failure_small_segment_area_fraction: float = 0.02,
+    failure_local_support_threshold: float = 0.60,
+    failure_dense_boundary_radius_px: int = 4,
+    failure_depth_penalty_reference_m: float = 1.0,
+    failure_depth_sampling_min_weight: float = 0.10,
+    eligible_body_ids: set[int] | None = None,
+    body_target_labels: dict[int, str] | None = None,
+    visibility_depth_relative_tolerance: float = (DEFAULT_VISIBILITY_DEPTH_RELATIVE_TOLERANCE),
+    visibility_depth_absolute_tolerance_m: float = (DEFAULT_VISIBILITY_DEPTH_ABSOLUTE_TOLERANCE_M),
+    exclude_raster_ambiguous: bool = True,
+) -> dict:
+    """Sample one shared physical 3D point set for a multiview still.
+
+    Candidate pixels are pooled from every camera, selected once by logical
+    segment, and projected back into all cameras. The ordered track ids therefore
+    identify the same physical surface points in every view. Visibility requires
+    renderer support from a matching exact geom and depth in the four pixels
+    surrounding the continuous projection. By default candidates with ambiguous
+    raster support in any camera are removed before sampling. ``failure_targeted``
+    mode stratifies selection toward small/thin supports, silhouettes, and
+    cross-view occlusions while retaining a baseline Kubric control bucket.
+    """
+    if max_points < 1:
+        raise ValueError("max_points must be at least 1")
+    if not camera_names:
+        raise ValueError("At least one camera is required")
+    if len(set(camera_names)) != len(camera_names):
+        raise ValueError("Camera names must be unique")
+    if not 0.0 <= max_sampled_fraction <= 1.0:
+        raise ValueError("max_sampled_fraction must be in [0, 1]")
+    if sampling_mode not in {"kubric", "failure_targeted"}:
+        raise ValueError("sampling_mode must be either 'kubric' or 'failure_targeted'")
+    if sampling_mode == "failure_targeted":
+        if failure_max_cross_view_candidates < max_points:
+            raise ValueError("failure_max_cross_view_candidates must be at least max_points")
+        if failure_min_source_edge_distance_px < 0:
+            raise ValueError("failure_min_source_edge_distance_px must be non-negative")
+        if failure_min_source_edge_distance_px > failure_edge_distance_px:
+            raise ValueError(
+                "failure_min_source_edge_distance_px must not exceed failure_edge_distance_px"
+            )
+    if eligible_body_ids is not None and include_background:
+        raise ValueError(
+            "include_background must be False when eligible_body_ids restricts candidates"
+        )
+
+    model = env.current_model
+    data = env.current_data
+    foreground_body_ids = (
+        get_trackable_body_ids(model)
+        if eligible_body_ids is None
+        else {int(body_id) for body_id in eligible_body_ids}
+    )
+    invalid_body_ids = {body_id for body_id in foreground_body_ids if not 0 < body_id < model.nbody}
+    if invalid_body_ids:
+        raise ValueError(f"Invalid eligible body ids: {sorted(invalid_body_ids)}")
+    if not foreground_body_ids:
+        raise ValueError("At least one eligible foreground body is required")
+    stride = max(1, int(sampling_stride))
+    phase_rng = np.random.RandomState(seed + 4242)
+    spatial_phase = tuple(int(value) for value in phase_rng.randint(0, stride, size=2))
+
+    candidate_batches = []
+    rendered_depths = {}
+    rendered_segment_maps = {}
+    rendered_segmentations = {}
+
+    for camera_name in camera_names:
+        if camera_name not in env.camera_manager.registry:
+            raise KeyError(f"Camera {camera_name!r} is not registered")
+        camera = env.camera_manager.registry[camera_name]
+        depth = np.asarray(env.render_depth_frame(camera_name)).copy()
+        segmentation = np.asarray(env.render_segmentation_frame(camera_name)).copy()
+        if depth.shape != (img_height, img_width) or segmentation.shape != (
+            img_height,
+            img_width,
+            3,
+        ):
+            raise ValueError(
+                f"Camera {camera_name!r} rasters do not match the requested image dimensions"
+            )
+        rendered_depths[camera_name] = depth
+        rendered_segmentations[camera_name] = segmentation
+        body_id_map = np.asarray(segmentation[:, :, 2], dtype=np.int32)
+        segment_map = _logical_segment_map(model, body_id_map, foreground_body_ids)
+        rendered_segment_maps[camera_name] = segment_map
+        local, body_ids, world, query = sample_kubric_candidates_from_image(
+            model,
+            data,
+            camera,
+            img_width,
+            img_height,
+            depth,
+            segmentation,
+            frame_index=0,
+            sampling_stride=stride,
+            spatial_phase=spatial_phase,
+            object_body_ids=foreground_body_ids,
+            include_background=include_background,
+            dense_boundary_radius_px=(
+                failure_dense_boundary_radius_px if sampling_mode == "failure_targeted" else 0
+            ),
+        )
+        if len(local) == 0:
+            continue
+        query_x = np.floor(query[:, 2]).astype(np.int64)
+        query_y = np.floor(query[:, 1]).astype(np.int64)
+        logical_segment_ids = get_kubric_segment_ids(model, body_ids, foreground_body_ids)
+        area_fraction, local_support, edge_distance = candidate_mask_context_features(
+            segment_map,
+            query,
+            logical_segment_ids,
+            local_radius_px=4,
+            max_edge_distance_px=max(1, int(np.ceil(failure_edge_distance_px))),
+        )
+        candidate_batches.append(
+            {
+                "local_coords": local,
+                "body_ids": body_ids,
+                "geom_ids": np.asarray(segmentation[query_y, query_x, 0], dtype=np.int32),
+                "world_coords": world,
+                "query_points": query,
+                "segment_ids": logical_segment_ids,
+                "source_cameras": np.full(len(local), camera_name),
+                "segment_area_fraction": area_fraction,
+                "local_segment_support": local_support,
+                "source_edge_distance": edge_distance,
+            }
+        )
+
+    if not candidate_batches:
+        raise RuntimeError("No eligible Kubric point candidates were visible in any camera")
+
+    # Every value has one row per candidate. Slice the entire dictionary whenever
+    # a filter or shortlist changes the pool, preserving physical point ordering.
+    candidates = {
+        key: np.concatenate([batch[key] for batch in candidate_batches], axis=0)
+        for key in candidate_batches[0]
+    }
+    expected_target_labels = None
+    if body_target_labels is not None:
+        missing_labels = set(int(body_id) for body_id in candidates["body_ids"]) - set(
+            int(body_id) for body_id in body_target_labels
+        )
+        if missing_labels:
+            raise ValueError(
+                f"Missing target labels for candidate body ids: {sorted(missing_labels)}"
+            )
+        candidates["target_labels"] = np.asarray(
+            [body_target_labels[int(body_id)] for body_id in candidates["body_ids"]],
+            dtype=str,
+        )
+        expected_target_labels = set(body_target_labels.values())
+        missing_visible_targets = expected_target_labels - set(candidates["target_labels"])
+        if missing_visible_targets:
+            raise RuntimeError(
+                f"No visible point candidates for target labels: {sorted(missing_visible_targets)}"
+            )
+
+    raw_candidate_count = len(candidates["local_coords"])
+    source_edge_unsafe_candidate_count = 0
+    candidates_before_cross_view_shortlist = len(candidates["local_coords"])
+    cross_view_candidate_count = len(candidates["local_coords"])
+    cross_view_shortlisted_out_count = 0
+    if sampling_mode == "failure_targeted":
+        safe_source_inset = candidates["source_edge_distance"] >= float(
+            failure_min_source_edge_distance_px
+        )
+        source_edge_unsafe_candidate_count = int((~safe_source_inset).sum())
+        if not np.any(safe_source_inset):
+            raise RuntimeError(
+                "No point candidates remain after applying the minimum source "
+                f"edge inset of {failure_min_source_edge_distance_px:g} px"
+            )
+        if not np.all(safe_source_inset):
+            candidates = {key: value[safe_source_inset] for key, value in candidates.items()}
+
+        if expected_target_labels is not None:
+            missing_safe_targets = expected_target_labels - set(candidates["target_labels"])
+            if missing_safe_targets:
+                raise RuntimeError(
+                    "Minimum source edge inset removed every candidate for target "
+                    f"labels: {sorted(missing_safe_targets)}"
+                )
+
+        candidates_before_cross_view_shortlist = len(candidates["local_coords"])
+        shortlist_indices = select_failure_targeted_cross_view_shortlist_indices(
+            candidates["segment_ids"],
+            candidates["source_cameras"],
+            candidates["source_edge_distance"],
+            candidates["segment_area_fraction"],
+            candidates["local_segment_support"],
+            max_candidates=failure_max_cross_view_candidates,
+            seed=seed + 7331,
+            edge_distance_px=failure_edge_distance_px,
+            prioritize_edges=failure_shortlist_prioritize_edges,
+            small_segment_area_fraction=(failure_small_segment_area_fraction),
+            local_support_threshold=failure_local_support_threshold,
+            target_labels=candidates.get("target_labels"),
+        )
+        if len(shortlist_indices) < len(candidates["local_coords"]):
+            candidates = {key: value[shortlist_indices] for key, value in candidates.items()}
+
+        cross_view_candidate_count = len(candidates["local_coords"])
+        cross_view_shortlisted_out_count = (
+            candidates_before_cross_view_shortlist - cross_view_candidate_count
+        )
+
+        if expected_target_labels is not None:
+            missing_shortlisted_targets = expected_target_labels - set(candidates["target_labels"])
+            if missing_shortlisted_targets:
+                raise RuntimeError(
+                    "Cross-view shortlist removed every candidate for target labels: "
+                    f"{sorted(missing_shortlisted_targets)}"
+                )
+
+    def project_points(camera_name, local_coords, body_ids, geom_ids):
+        points_2d, visibility, points_3d, diagnostics = track_points_for_frame(
+            data,
+            local_coords,
+            body_ids,
+            env.camera_manager.registry[camera_name],
+            img_width,
+            img_height,
+            rendered_depths[camera_name],
+            return_diagnostics=True,
+            segmentation_frame=rendered_segmentations[camera_name],
+            geom_ids=geom_ids,
+            visibility_depth_relative_tolerance=visibility_depth_relative_tolerance,
+            visibility_depth_absolute_tolerance_m=visibility_depth_absolute_tolerance_m,
+        )
+        return {
+            "points_2d": points_2d,
+            "visibility": visibility,
+            "points_3d": points_3d,
+            **diagnostics,
+        }
+
+    cached_candidate_cameras: dict[str, dict[str, np.ndarray]] = {}
+    candidates["occluder_edge_distance"] = np.full(
+        len(candidates["local_coords"]),
+        float(np.ceil(failure_edge_distance_px) + 1),
+        dtype=np.float32,
+    )
+    candidates["source_depth"] = np.full(len(candidates["local_coords"]), np.nan, dtype=np.float32)
+    candidates["depth_penalized_area"] = candidates["segment_area_fraction"]
+    candidates["depth_penalized_support"] = candidates["local_segment_support"]
+    candidate_bucket_counts: dict[str, int]
+    raster_ambiguous_candidate_count = 0
+    # Both modes must check all views before sampling when ambiguity is excluded.
+    # Failure targeting also needs these projections to form its occlusion buckets.
+    if sampling_mode == "failure_targeted" or exclude_raster_ambiguous:
+        for camera_name in camera_names:
+            projected = project_points(
+                camera_name,
+                candidates["local_coords"],
+                candidates["body_ids"],
+                candidates["geom_ids"],
+            )
+            cached_candidate_cameras[camera_name] = projected
+            source_mask = candidates["source_cameras"] == camera_name
+            candidates["source_depth"][source_mask] = projected["point_depth"][source_mask]
+            if sampling_mode == "failure_targeted":
+                occluded = projected["in_frame"] & (projected["visibility"] <= 0.5)
+                occluder_edge = _occluder_edge_distances(
+                    rendered_segment_maps[camera_name],
+                    projected["points_2d"],
+                    occluded,
+                    max(1, int(np.ceil(failure_edge_distance_px))),
+                )
+                candidates["occluder_edge_distance"] = np.minimum(
+                    candidates["occluder_edge_distance"], occluder_edge
+                )
+
+    if exclude_raster_ambiguous:
+        ambiguous = np.any(
+            [values["raster_ambiguous"] for values in cached_candidate_cameras.values()], axis=0
+        )
+        raster_ambiguous_candidate_count = int(ambiguous.sum())
+        keep = ~ambiguous
+        if not np.any(keep):
+            raise RuntimeError("All multiview point candidates had ambiguous raster visibility")
+        candidates = {key: value[keep] for key, value in candidates.items()}
+        cached_candidate_cameras = {
+            name: {key: value[keep] for key, value in values.items()}
+            for name, values in cached_candidate_cameras.items()
+        }
+        if expected_target_labels is not None:
+            missing_after_filter = expected_target_labels - set(candidates["target_labels"])
+            if missing_after_filter:
+                raise RuntimeError(
+                    "Raster visibility filtering removed every candidate for target "
+                    f"labels: {sorted(missing_after_filter)}"
+                )
+
+    if sampling_mode == "failure_targeted":
+        candidates["depth_penalized_area"], candidates["depth_penalized_support"] = (
+            depth_penalized_size_features(
+                candidates["segment_area_fraction"],
+                candidates["local_segment_support"],
+                candidates["source_depth"],
+                reference_depth_m=failure_depth_penalty_reference_m,
+            )
+        )
+        visibility_matrix = np.stack(
+            [cached_candidate_cameras[name]["visibility"] > 0.5 for name in camera_names]
+        )
+        in_frame_matrix = np.stack(
+            [cached_candidate_cameras[name]["in_frame"] for name in camera_names]
+        )
+
+    def select_candidates(indices, budget, selection_seed):
+        if sampling_mode == "kubric":
+            selected = select_kubric_candidate_indices(
+                candidates["body_ids"][indices],
+                max_points=budget,
+                seed=selection_seed,
+                max_sampled_fraction=max_sampled_fraction,
+                segment_ids=candidates["segment_ids"][indices],
+            )
+            return (
+                selected,
+                np.full(len(selected), "kubric", dtype="<U24"),
+                {"kubric": len(indices)},
+            )
+        return select_failure_targeted_candidate_indices(
+            candidates["segment_ids"][indices],
+            candidates["source_edge_distance"][indices],
+            candidates["segment_area_fraction"][indices],
+            candidates["local_segment_support"][indices],
+            visibility_matrix[:, indices],
+            in_frame_matrix[:, indices],
+            candidates["occluder_edge_distance"][indices],
+            max_points=budget,
+            seed=selection_seed,
+            target_fractions=failure_target_fractions,
+            edge_distance_px=failure_edge_distance_px,
+            minimum_source_edge_distance_px=failure_min_source_edge_distance_px,
+            small_segment_area_fraction=failure_small_segment_area_fraction,
+            local_support_threshold=failure_local_support_threshold,
+            source_depth_m=candidates["source_depth"][indices],
+            depth_penalty_reference_m=failure_depth_penalty_reference_m,
+            depth_sampling_min_weight=failure_depth_sampling_min_weight,
+        )
+
+    # One broad pool by default; explicit targets receive equal point budgets.
+    if "target_labels" in candidates:
+        target_groups = [
+            np.flatnonzero(candidates["target_labels"] == name)
+            for name in sorted(set(candidates["target_labels"]))
+        ]
+    else:
+        target_groups = [np.arange(len(candidates["local_coords"]))]
+    target_budgets = np.full(len(target_groups), max_points // len(target_groups), dtype=np.int64)
+    target_budgets[: max_points % len(target_groups)] += 1
+    selected_parts, bucket_parts = [], []
+    candidate_bucket_counts = {}
+    for target_index, (indices, budget) in enumerate(zip(target_groups, target_budgets)):
+        target_selected, target_buckets, target_counts = select_candidates(
+            indices, int(budget), seed + 9999 + target_index * 1009
+        )
+        selected_parts.append(indices[target_selected])
+        bucket_parts.append(target_buckets)
+        for name, count in target_counts.items():
+            candidate_bucket_counts[name] = candidate_bucket_counts.get(name, 0) + count
+    selected = np.concatenate(selected_parts)
+    selected_buckets = np.concatenate(bucket_parts)
+    if "target_labels" in candidates:
+        order = np.random.RandomState(seed + 19999).permutation(len(selected))
+        selected = selected[order]
+        selected_buckets = selected_buckets[order]
+
+    selected_local = np.asarray(candidates["local_coords"][selected], dtype=np.float32)
+    selected_body_ids = np.asarray(candidates["body_ids"][selected], dtype=np.int32)
+    selected_geom_ids = np.asarray(candidates["geom_ids"][selected], dtype=np.int32)
+    selected_world = np.asarray(candidates["world_coords"][selected], dtype=np.float32)
+    selected_segment_ids = np.asarray(candidates["segment_ids"][selected], dtype=np.int32)
+    selected_object_names = get_kubric_segment_names(model, selected_segment_ids)
+    selected_source_cameras = np.asarray(candidates["source_cameras"][selected])
+    selected_segment_area_fraction = np.asarray(
+        candidates["segment_area_fraction"][selected], dtype=np.float32
+    )
+    selected_local_segment_support = np.asarray(
+        candidates["local_segment_support"][selected], dtype=np.float32
+    )
+    selected_source_edge_distance = np.asarray(
+        candidates["source_edge_distance"][selected], dtype=np.float32
+    )
+    selected_occluder_edge_distance = np.asarray(
+        candidates["occluder_edge_distance"][selected], dtype=np.float32
+    )
+    selected_source_depth = np.asarray(candidates["source_depth"][selected], dtype=np.float32)
+    selected_depth_penalized_area = np.asarray(
+        candidates["depth_penalized_area"][selected], dtype=np.float32
+    )
+    selected_depth_penalized_support = np.asarray(
+        candidates["depth_penalized_support"][selected], dtype=np.float32
+    )
+    selected_target_labels = (
+        None if "target_labels" not in candidates else candidates["target_labels"][selected]
+    )
+    selected_query_points = np.asarray(candidates["query_points"][selected], dtype=np.float32)
+    surface_normals = estimate_aligned_surface_normals(
+        model=model,
+        data=data,
+        camera_names=camera_names,
+        camera_registry=env.camera_manager.registry,
+        rendered_depths=rendered_depths,
+        rendered_segmentations=rendered_segmentations,
+        query_points=selected_query_points,
+        source_cameras=selected_source_cameras,
+        world_points=selected_world,
+        body_ids=selected_body_ids,
+        geom_ids=selected_geom_ids,
+        img_width=img_width,
+        img_height=img_height,
+    )
+
+    camera_points = {}
+    for camera_name in camera_names:
+        camera = env.camera_manager.registry[camera_name]
+        if cached_candidate_cameras:
+            projected = {
+                key: value[selected] for key, value in cached_candidate_cameras[camera_name].items()
+            }
+        else:
+            projected = project_points(
+                camera_name, selected_local, selected_body_ids, selected_geom_ids
+            )
+            source_mask = selected_source_cameras == camera_name
+            selected_source_depth[source_mask] = projected["point_depth"][source_mask]
+        _, intrinsics = _build_camera_matrices(camera, img_width, img_height)
+        camera_points[camera_name] = {**projected, "intrinsics": intrinsics}
+
+    visible_camera_count = np.sum(
+        np.stack(
+            [camera_points[name]["visibility"] > 0.5 for name in camera_names],
+            axis=0,
+        ),
+        axis=0,
+    ).astype(np.int16)
+    in_frame_occluded_camera_count = np.sum(
+        np.stack(
+            [
+                camera_points[name]["in_frame"] & (camera_points[name]["visibility"] <= 0.5)
+                for name in camera_names
+            ],
+            axis=0,
+        ),
+        axis=0,
+    ).astype(np.int16)
+    selected_bucket_names, selected_bucket_counts = np.unique(selected_buckets, return_counts=True)
+    candidate_count_names = np.asarray(list(candidate_bucket_counts), dtype=str)
+    candidate_count_values = np.asarray(list(candidate_bucket_counts.values()), dtype=np.int64)
+
+    result = {
+        "sampling_method": sampling_mode,
+        "sampling_stride": stride,
+        "sampling_phase": np.asarray((0, *spatial_phase), dtype=np.int32),
+        "max_sampled_fraction": float(max_sampled_fraction),
+        "include_background": bool(include_background),
+        "visibility_method": RASTER_VISIBILITY_METHOD,
+        "visibility_depth_relative_tolerance": float(visibility_depth_relative_tolerance),
+        "visibility_depth_absolute_tolerance_m": float(visibility_depth_absolute_tolerance_m),
+        "exclude_raster_ambiguous": bool(exclude_raster_ambiguous),
+        "num_raw_candidates": raw_candidate_count,
+        "num_source_edge_unsafe_candidates_excluded": (source_edge_unsafe_candidate_count),
+        "num_candidates_before_cross_view_shortlist": (candidates_before_cross_view_shortlist),
+        "num_cross_view_candidates": cross_view_candidate_count,
+        "num_cross_view_candidates_shortlisted_out": (cross_view_shortlisted_out_count),
+        "num_candidates": len(candidates["local_coords"]),
+        "num_raster_ambiguous_candidates_filtered": (raster_ambiguous_candidate_count),
+        "track_ids": np.arange(max_points, dtype=np.int32),
+        "body_ids": selected_body_ids,
+        "geom_ids": selected_geom_ids,
+        "segment_ids": selected_segment_ids,
+        "point_object_names": selected_object_names,
+        "local_coords": selected_local,
+        "points_3d": selected_world,
+        "query_points": selected_query_points,
+        "query_source_cameras": selected_source_cameras,
+        "surface_normal_orientation": "toward_query_source_camera",
+        "surface_normal_world_frame": "mujoco_world",
+        "surface_normal_local_frame": "owning_body_local",
+        "surface_normal_camera_frame": "query_source_camera_cv",
+        **surface_normals,
+        "sampling_buckets": np.asarray(selected_buckets, dtype=str),
+        "selected_bucket_names": np.asarray(selected_bucket_names, dtype=str),
+        "selected_bucket_counts": np.asarray(selected_bucket_counts, dtype=np.int64),
+        "candidate_bucket_names": candidate_count_names,
+        "candidate_bucket_counts": candidate_count_values,
+        "failure_target_bucket_names": np.asarray(FAILURE_TARGET_BUCKET_NAMES, dtype=str),
+        "failure_target_fractions": np.asarray(failure_target_fractions, dtype=np.float32),
+        "source_segment_area_fraction": selected_segment_area_fraction,
+        "source_local_segment_support": selected_local_segment_support,
+        "source_edge_distance_px": selected_source_edge_distance,
+        "source_depth_m": selected_source_depth,
+        "depth_penalized_segment_area_fraction": selected_depth_penalized_area,
+        "depth_penalized_local_segment_support": selected_depth_penalized_support,
+        "occluder_edge_distance_px": selected_occluder_edge_distance,
+        "visible_camera_count": visible_camera_count,
+        "in_frame_occluded_camera_count": in_frame_occluded_camera_count,
+        "failure_edge_distance_px": float(failure_edge_distance_px),
+        "failure_min_source_edge_distance_px": float(failure_min_source_edge_distance_px),
+        "failure_max_cross_view_candidates": int(failure_max_cross_view_candidates),
+        "failure_shortlist_prioritize_edges": bool(failure_shortlist_prioritize_edges),
+        "failure_small_segment_area_fraction": float(failure_small_segment_area_fraction),
+        "failure_local_support_threshold": float(failure_local_support_threshold),
+        "failure_dense_boundary_radius_px": int(failure_dense_boundary_radius_px),
+        "failure_depth_penalty_reference_m": float(failure_depth_penalty_reference_m),
+        "failure_depth_sampling_min_weight": float(failure_depth_sampling_min_weight),
+        "cameras": camera_points,
+    }
+    if selected_target_labels is not None:
+        result["point_target_labels"] = selected_target_labels
+        result["eligible_body_ids"] = np.asarray(sorted(foreground_body_ids), dtype=np.int32)
+    return result
 
 
 def track_points_for_frame(

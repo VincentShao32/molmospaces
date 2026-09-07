@@ -126,6 +126,63 @@ class MlSpacesExpConfig(Config, ABC):
     point_track_exclude_raster_ambiguous: bool = True
     point_track_visibility_max_rejection_rounds: int = 32
 
+    # Phase-stratified multiview snapshots. When enabled, one synchronized image
+    # set is sampled uniformly from each required policy phase. ``release`` is a
+    # semantic alias for the gripper-open phase that occurs after ``place``.
+    generate_phase_snapshots: bool = False
+    phase_snapshots_only: bool = False
+    phase_snapshot_required_phases: tuple[str, ...] = (
+        "pregrasp",
+        "grasp",
+        "gripper-close",
+        "lift",
+        "preplace",
+        "place",
+        "release",
+        "retreat",
+        "go_home",
+    )
+    phase_snapshot_samples_per_phase: int = 1
+    phase_snapshot_generate_points: bool = False
+    phase_snapshot_num_points: int = 1000
+    phase_snapshot_point_sampling_stride: int = 4
+    phase_snapshot_point_max_sampled_fraction: float = 0.1
+    phase_snapshot_point_include_background: bool = True
+    # Restrict phase-snapshot candidates to task-specific body sets. The
+    # default preserves the broad object/robot/background behavior; the
+    # gripper-and-pickup scope keeps only the active gripper assembly and the
+    # object named by task_config.pickup_obj_name.
+    phase_snapshot_point_target_scope: str = "all_trackable"
+    # ``failure_targeted`` retains a Kubric control bucket while oversampling
+    # cross-view occlusions, silhouettes, and small/thin projected supports.
+    phase_snapshot_point_sampling_mode: str = "kubric"
+    # In FAILURE_TARGET_BUCKET_NAMES order; selection consumes buckets in this order.
+    phase_snapshot_point_failure_target_fractions: tuple[float, ...] = (
+        0.20,  # occlusion_edge
+        0.15,  # cross_view_occlusion
+        0.20,  # object_edge
+        0.20,  # small_thin
+        0.25,  # baseline (also fills unavailable targeted quotas)
+    )
+    phase_snapshot_point_failure_edge_distance_px: float = 4.0
+    # Exclude boundary-adjacent query points from every failure-targeted bucket.
+    # The object-edge bucket remains active in the annulus between this minimum
+    # inset and ``phase_snapshot_point_failure_edge_distance_px``.
+    phase_snapshot_point_failure_min_source_edge_distance_px: float = 2.0
+    # Bound the expensive exact cross-view visibility pass. The shortlist is
+    # balanced across source cameras and logical segments while reserving
+    # representation for safe edge and small/thin candidates.
+    phase_snapshot_point_failure_max_cross_view_candidates: int = 15_000
+    # Whether the pre-cross-view shortlist should reserve capacity for edge
+    # candidates. This is independent of the final bucket fractions so runs
+    # that do not target edges can still retain small/thin prioritization.
+    phase_snapshot_point_failure_shortlist_prioritize_edges: bool = True
+    phase_snapshot_point_failure_small_segment_area_fraction: float = 0.02
+    phase_snapshot_point_failure_local_support_threshold: float = 0.60
+    phase_snapshot_point_failure_dense_boundary_radius_px: int = 4
+    phase_snapshot_point_failure_depth_penalty_reference_m: float = 1.0
+    phase_snapshot_point_failure_depth_sampling_min_weight: float = 0.10
+
     def model_post_init(self, _context) -> None:
         """This serves as the __init__() called after internal validation of config parameters"""
         assert (self.policy_dt_ms / self.ctrl_dt_ms).is_integer(), (

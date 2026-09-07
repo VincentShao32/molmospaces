@@ -1,4 +1,5 @@
 import gc
+import json
 import logging
 import multiprocessing as mp
 import os
@@ -21,6 +22,11 @@ import torch
 import wandb
 
 from molmo_spaces.configs.abstract_exp_config import MlSpacesExpConfig
+from molmo_spaces.data_generation.phase_snapshot_utils import (
+    PhaseSnapshotCollector,
+    discard_camera_frames,
+    save_phase_snapshot_episode,
+)
 from molmo_spaces.molmo_spaces_constants import get_scenes
 from molmo_spaces.policy.base_policy import BasePolicy
 from molmo_spaces.tasks.task import BaseMujocoTask
@@ -35,7 +41,9 @@ from molmo_spaces.utils.point_tracking_utils import (
     RASTER_VISIBILITY_METHOD,
     _build_camera_matrices,
     get_kubric_segment_ids,
+    get_manipulation_target_body_ids,
     get_trackable_body_ids,
+    sample_aligned_kubric_points_for_frame,
     sample_from_image,
     sample_kubric_candidates_from_image,
     sample_mesh_vertices,
@@ -129,7 +137,10 @@ def setup_house_dirs(
         total_batches = 1
     batch_suffix = f"_batch_{batch_num}_of_{total_batches}"
 
-    batch_file = house_output_dir / f"trajectories{batch_suffix}.h5"
+    if getattr(exp_config, "phase_snapshots_only", False):
+        batch_file = house_output_dir / f"phase_snapshots{batch_suffix}.json"
+    else:
+        batch_file = house_output_dir / f"trajectories{batch_suffix}.h5"
     should_skip = batch_file.exists()
 
     return house_output_dir, house_debug_dir, batch_suffix, should_skip
@@ -237,6 +248,10 @@ def save_house_trajectories(
         return
 
     pt_only = getattr(exp_config, "point_tracks_only", False)
+    phase_snapshots_enabled = getattr(exp_config, "generate_phase_snapshots", False)
+    phase_snapshots_only = getattr(exp_config, "phase_snapshots_only", False)
+    if phase_snapshots_only and not phase_snapshots_enabled:
+        raise ValueError("phase_snapshots_only requires generate_phase_snapshots=True")
     batch_info = f" batch {batch_num}/{total_batches}" if batch_num is not None else ""
     worker_logger.info(
         f"Batching and saving trajectory data for {house_output_dir.name}{batch_info}: "
@@ -251,7 +266,26 @@ def save_house_trajectories(
             datagen_profiler.start("save_batch_prep")
 
         house_trajectory_data = []
+        phase_snapshot_manifest = []
         for idx, episode_info in enumerate(house_raw_histories):
+            phase_snapshot_data = episode_info.pop("phase_snapshot_data", None)
+            if phase_snapshots_enabled:
+                if phase_snapshot_data is None:
+                    raise RuntimeError(f"Episode {idx} is missing required phase snapshot data")
+                phase_snapshot_manifest.append(
+                    save_phase_snapshot_episode(
+                        phase_snapshot_data,
+                        output_dir=house_output_dir,
+                        episode_index=idx,
+                        batch_suffix=batch_suffix,
+                        scene_metadata=episode_info["history"].get("obs_scene"),
+                    )
+                )
+
+            if phase_snapshots_only:
+                del episode_info["history"]
+                episode_info.pop("point_track_data", None)
+                continue
             if pt_only:
                 # Save only RGB videos, skip all batching / HDF5 prep
                 observations_list = episode_info["history"].get("observations", [])
@@ -317,6 +351,26 @@ def save_house_trajectories(
                     f"{cam_tracks['trajs_2d'].shape[1]} points, "
                     f"{cam_tracks['trajs_2d'].shape[0]} frames)"
                 )
+
+        if phase_snapshots_enabled:
+            manifest_path = house_output_dir / f"phase_snapshots{batch_suffix}.json"
+            manifest = {
+                "house": house_output_dir.name,
+                "batch_suffix": batch_suffix,
+                "num_episodes": len(phase_snapshot_manifest),
+                "episodes": phase_snapshot_manifest,
+            }
+            manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+
+        if phase_snapshots_only:
+            if datagen_profiler is not None:
+                datagen_profiler.end("save_batch_prep")
+            total_time = time.perf_counter() - t_start
+            worker_logger.info(
+                f"Successfully saved {len(phase_snapshot_manifest)} phase-snapshot "
+                f"episode(s) for {house_output_dir.name} in {total_time:.2f}s"
+            )
+            return
 
         t_batch = time.perf_counter() - t_start
         if datagen_profiler is not None:
@@ -823,6 +877,119 @@ class ParallelRolloutRunner:
         if datagen_profiler is not None:
             datagen_profiler.end("rollout_reset")
 
+        # Phase-stratified snapshot setup. The collector uses one reservoir per
+        # requested phase, retaining synchronized camera frames without keeping
+        # complete videos in memory.
+        phase_snapshot_collector = None
+        phase_snapshot_frame_index = 0
+        phase_snapshot_camera_names: tuple[str, ...] = ()
+        phase_snapshot_payload_factory = None
+        phase_snapshot_target_body_ids = None
+        phase_snapshot_target_body_labels = None
+        phase_snapshots_only = bool(
+            exp_config and getattr(exp_config, "phase_snapshots_only", False)
+        )
+
+        def build_phase_snapshot_payload():
+            # observe() calls this synchronously only when a frame enters a reservoir.
+            return {
+                "points": sample_aligned_kubric_points_for_frame(
+                    task.env,
+                    phase_snapshot_camera_names,
+                    exp_config.camera_config.img_resolution[0],
+                    exp_config.camera_config.img_resolution[1],
+                    max_points=exp_config.phase_snapshot_num_points,
+                    seed=episode_seed + phase_snapshot_frame_index * 104729,
+                    sampling_stride=exp_config.phase_snapshot_point_sampling_stride,
+                    max_sampled_fraction=exp_config.phase_snapshot_point_max_sampled_fraction,
+                    include_background=exp_config.phase_snapshot_point_include_background,
+                    sampling_mode=exp_config.phase_snapshot_point_sampling_mode,
+                    failure_target_fractions=(
+                        exp_config.phase_snapshot_point_failure_target_fractions
+                    ),
+                    failure_edge_distance_px=(
+                        exp_config.phase_snapshot_point_failure_edge_distance_px
+                    ),
+                    failure_min_source_edge_distance_px=(
+                        exp_config.phase_snapshot_point_failure_min_source_edge_distance_px
+                    ),
+                    failure_max_cross_view_candidates=(
+                        exp_config.phase_snapshot_point_failure_max_cross_view_candidates
+                    ),
+                    failure_shortlist_prioritize_edges=(
+                        exp_config.phase_snapshot_point_failure_shortlist_prioritize_edges
+                    ),
+                    failure_small_segment_area_fraction=(
+                        exp_config.phase_snapshot_point_failure_small_segment_area_fraction
+                    ),
+                    failure_local_support_threshold=(
+                        exp_config.phase_snapshot_point_failure_local_support_threshold
+                    ),
+                    failure_dense_boundary_radius_px=(
+                        exp_config.phase_snapshot_point_failure_dense_boundary_radius_px
+                    ),
+                    failure_depth_penalty_reference_m=(
+                        exp_config.phase_snapshot_point_failure_depth_penalty_reference_m
+                    ),
+                    failure_depth_sampling_min_weight=(
+                        exp_config.phase_snapshot_point_failure_depth_sampling_min_weight
+                    ),
+                    eligible_body_ids=phase_snapshot_target_body_ids,
+                    body_target_labels=phase_snapshot_target_body_labels,
+                )
+            }
+
+        if phase_snapshots_only and not getattr(exp_config, "generate_phase_snapshots", False):
+            raise ValueError("phase_snapshots_only requires generate_phase_snapshots=True")
+
+        task._phase_snapshot_data = None
+        if exp_config and getattr(exp_config, "generate_phase_snapshots", False):
+            if not hasattr(policy, "get_all_phases"):
+                raise TypeError(
+                    "Phase snapshots require a planner policy that exposes get_all_phases()"
+                )
+            if phase_snapshots_only and getattr(exp_config, "generate_point_tracks", False):
+                raise ValueError(
+                    "phase_snapshots_only cannot be combined with temporal point tracks"
+                )
+            phase_snapshot_camera_names = tuple(
+                camera.name for camera in exp_config.camera_config.cameras
+            )
+            if exp_config.phase_snapshot_generate_points:
+                phase_snapshot_payload_factory = build_phase_snapshot_payload
+            point_target_scope = getattr(
+                exp_config,
+                "phase_snapshot_point_target_scope",
+                "all_trackable",
+            )
+            if point_target_scope == "gripper_and_pickup":
+                if exp_config.phase_snapshot_point_include_background:
+                    raise ValueError(
+                        "gripper_and_pickup point targeting requires "
+                        "phase_snapshot_point_include_background=False"
+                    )
+                (
+                    phase_snapshot_target_body_ids,
+                    phase_snapshot_target_body_labels,
+                ) = get_manipulation_target_body_ids(task)
+            elif point_target_scope != "all_trackable":
+                raise ValueError(
+                    "phase_snapshot_point_target_scope must be "
+                    "'all_trackable' or 'gripper_and_pickup'"
+                )
+            phase_snapshot_collector = PhaseSnapshotCollector(
+                phase_name_to_id=policy.get_all_phases(),
+                camera_names=phase_snapshot_camera_names,
+                required_phases=exp_config.phase_snapshot_required_phases,
+                samples_per_phase=exp_config.phase_snapshot_samples_per_phase,
+                seed=episode_seed,
+            )
+            phase_snapshot_collector.observe(
+                observation,
+                frame_index=phase_snapshot_frame_index,
+                snapshot_payload_factory=phase_snapshot_payload_factory,
+            )
+
         # Point tracking setup
         do_point_tracking = getattr(exp_config, "generate_point_tracks", False)
         pt_sampling = getattr(exp_config, "point_track_sampling", "vertex")
@@ -1133,10 +1300,22 @@ class ParallelRolloutRunner:
             if action_chunk[0] is None:
                 print("Policy returned None action, ending episode")
                 break
+            if phase_snapshots_only:
+                # The current observation has already been consumed by both the
+                # policy and collector. Remove rendered arrays from the task cache
+                # before advancing to keep snapshot-only memory bounded.
+                discard_camera_frames(observation, phase_snapshot_camera_names)
             observation, reward, terminal, truncated, infos = task.step_chunk(
                 action_chunk, stop_on_success=end_on_success
             )
             step_count += len(action_chunk)
+            if phase_snapshot_collector is not None:
+                phase_snapshot_frame_index += 1
+                phase_snapshot_collector.observe(
+                    observation,
+                    frame_index=phase_snapshot_frame_index,
+                    snapshot_payload_factory=phase_snapshot_payload_factory,
+                )
             if profiler is not None:
                 profiler.end("task_step")
             if datagen_profiler is not None:
@@ -1285,6 +1464,17 @@ class ParallelRolloutRunner:
 
         # Check success if method exists
         success = task.judge_success() if hasattr(task, "judge_success") else False
+
+        if phase_snapshot_collector is not None:
+            if phase_snapshots_only:
+                discard_camera_frames(observation, phase_snapshot_camera_names)
+            task._phase_snapshot_data = phase_snapshot_collector.finalize(episode_seed=episode_seed)
+            if not phase_snapshot_collector.is_complete:
+                print(
+                    "Rejecting phase-snapshot episode because it did not reach "
+                    f"required phase(s): {phase_snapshot_collector.missing_phases}"
+                )
+                success = False
 
         # Stash point tracking data on the task for the caller to retrieve
         if do_point_tracking and len(pt_per_camera) > 0:
@@ -1611,9 +1801,14 @@ class ParallelRolloutRunner:
             exp_config, house_id, batch_num, total_batches
         )
         if should_skip:
+            completed_output = (
+                house_output_dir / f"phase_snapshots{batch_suffix}.json"
+                if getattr(exp_config, "phase_snapshots_only", False)
+                else house_output_dir / f"trajectories{batch_suffix}.h5"
+            )
             worker_logger.info(
                 f"SKIPPING HOUSE {house_id} BATCH {batch_num}/{total_batches}: "
-                f"Output already exists at {house_output_dir / f'trajectories{batch_suffix}.h5'}"
+                f"Output already exists at {completed_output}"
             )
             return 0, 0, False
 
@@ -1814,6 +2009,9 @@ class ParallelRolloutRunner:
                             pt_data = getattr(task, "_point_track_data", None)
                             if pt_data:
                                 episode_info["point_track_data"] = pt_data
+                            phase_snapshot_data = getattr(task, "_phase_snapshot_data", None)
+                            if phase_snapshot_data is not None:
+                                episode_info["phase_snapshot_data"] = phase_snapshot_data
 
                             if should_save:
                                 house_raw_histories.append(episode_info)
